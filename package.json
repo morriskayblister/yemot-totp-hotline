@@ -4,11 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "bun run --watch src/index.ts",
-    "start": "bun run src/index.ts",
+    "dev": "npx bun run --watch src/index.ts",
+    "start": "npx bun run src/index.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "bun": "^1.1.0",
     "hono": "^4.6.0"
   },
   "devDependencies": {
