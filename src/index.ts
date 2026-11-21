@@ -185,7 +185,7 @@ async function handleYemot(c: Context) {
     const accounts = await sb(`totp_accounts?user_id=eq.${user.id}&slot_number=eq.${slot}&select=*`);
     if (!accounts[0]) return ivr(say("אין חשבון במשבצת זו"), "hangup=yes");
     const code = await totp(accounts[0].totp_secret, accounts[0].digits, accounts[0].period);
-    return ivr(say(`הקוד שלך הוא ${code.split("").join(" ")}`), "hangup=yes");
+    return ivr(say("הקוד שלך הוא"), `id_list_message=d-${code}`, "hangup=yes");
   }
 
   // Menu choice
