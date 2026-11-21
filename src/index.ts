@@ -116,18 +116,25 @@ function say(text: string) {
   return `id_list_message=t-${text}`;
 }
 
-// Yemot read command:
-// read=t-<prompt>=<varName>,<timeout>,<min>,<max>,<digits_type>,<voice>,<file>,<enter_if_empty>
-// Yemot calls this same URL again with the entered digits in a query parameter named <varName>.
-function readCmd(prompt: string, varName: string, min: number, max: number, timeout = 10) {
+// Yemot read command, field order from the official API module doc:
+// read=t-<prompt>=<val_name>,<re_enter_if_exists>,<max>,<min>,<sec_wait>,<typing_playback_mode>,<block_asterisk>,<block_zero>
+// Yemot calls this same URL again with the entered digits in a query parameter named <val_name>.
+function readCmd(prompt: string, valName: string, opts: { min: number; max: number; timeout?: number }) {
   const safePrompt = prompt.replace(/[,=]/g, " ");
-  return `read=t-${safePrompt}=${varName},${timeout},${min},${max},SecDigits,no,,yes`;
+  const timeout = opts.timeout ?? 10;
+  return `read=t-${safePrompt}=${valName},no,${opts.max},${opts.min},${timeout},Digits,no,no`;
 }
 
 // ---------- IVR flow ----------
-// Query params from Yemot: ApiPhone (caller). Read results come back as params named after the read variable:
+// Query params from Yemot: ApiPhone (caller). Read results come back as params named after the read val_name:
 // pin_set (new PIN), pin (login PIN), menu (menu choice), slot (account slot).
 async function handleYemot(c: Context) {
+  // Yemot sends hangup=yes when the caller disconnects. Nothing to say; return an empty body.
+  if (c.req.query("hangup") === "yes") {
+    console.log(JSON.stringify({ ev: "hangup", query: c.req.queries() }));
+    return new Response("", { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+  }
+
   const phone = (c.req.query("ApiPhone") ?? "").replace(/\D/g, "");
   if (!phone) return ivr(say("Caller ID missing, goodbye"), "hangup=yes");
 
@@ -147,16 +154,16 @@ async function handleYemot(c: Context) {
     if (entered !== undefined) {
       const { digits } = decodeDtmf(entered);
       if (digits.length !== 4) {
-        return ivr(say("Invalid PIN"), readCmd("Please choose a 4 digit PIN followed by pound", "pin_set", 4, 4));
+        return ivr(say("Invalid PIN"), readCmd("אנא בחר קוד סודי בן 4 ספרות", "pin_set", { min: 4, max: 4, timeout: 10 }));
       }
       const salt = crypto.randomUUID().slice(0, 8);
       await sb(`auth_users?id=eq.${user.id}`, {
         method: "PATCH",
         body: JSON.stringify({ pin_hash: await hashPin(digits, salt), pin_failures: 0, pin_locked_until: null }),
       });
-      return ivr(say("PIN saved"), readCmd("Press 1 for codes, 2 to add an account", "menu", 1, 1));
+      return ivr(say("PIN saved"), readCmd("לקודים הקש 1, להוספת חשבון הקש 2", "menu", { min: 1, max: 1 }));
     }
-    return ivr(readCmd("Welcome. Please choose a 4 digit PIN followed by pound", "pin_set", 4, 4));
+    return ivr(readCmd("שלום אנא בחר קוד סודי בן 4 ספרות", "pin_set", { min: 4, max: 4, timeout: 10 }));
   }
 
   if (user.pin_locked_until && new Date(user.pin_locked_until) > new Date()) {
@@ -175,17 +182,17 @@ async function handleYemot(c: Context) {
         body: JSON.stringify({ pin_failures: lock ? 0 : failures, pin_locked_until: lock }),
       });
       if (lock) return ivr(say("Too many attempts, try again later"), "hangup=yes");
-      return ivr(say("Wrong PIN"), readCmd("Enter your PIN followed by pound", "pin", 4, 4));
+      return ivr(say("Wrong PIN"), readCmd("אנא הקש קוד סודי", "pin", { min: 4, max: 4, timeout: 10 }));
     }
     await sb(`auth_users?id=eq.${user.id}`, { method: "PATCH", body: JSON.stringify({ pin_failures: 0 }) });
-    return ivr(readCmd("Press 1 for codes, 2 to add an account", "menu", 1, 1));
+    return ivr(readCmd("לקודים הקש 1, להוספת חשבון הקש 2", "menu", { min: 1, max: 1 }));
   }
 
   // Menu choice
   const menuIn = c.req.query("menu");
   if (menuIn !== undefined) {
     const choice = decodeDtmf(menuIn).digits;
-    if (choice === "1") return ivr(readCmd("Enter the account slot", "slot", 1, 2));
+    if (choice === "1") return ivr(readCmd("הקש מספר משבצת", "slot", { min: 1, max: 2 }));
     if (choice === "2") return ivr(say("Adding accounts by phone is not available yet"), "hangup=yes");
     return ivr(say("Invalid choice"), "hangup=yes");
   }
@@ -201,7 +208,7 @@ async function handleYemot(c: Context) {
   }
 
   // Default: ask for PIN
-  return ivr(readCmd("Enter your PIN followed by pound", "pin", 4, 4));
+  return ivr(readCmd("אנא הקש קוד סודי", "pin", { min: 4, max: 4, timeout: 10 }));
 }
 
 app.get("/yemot", async (c) => {
