@@ -267,21 +267,21 @@ yemotRoute("/yemot/ext999", async (c) => {
 });
 
 // ---------- Extension 1: main menu (authenticated calls only) ----------
-const MENU_PROMPT = "לקבלת קוד הקש 11, להזנת חשבון חדש הקש 12";
+const MENU_PROMPT = "לקבלת קוד הקש 1 להזנת חשבון חדש הקש 2";
 
 yemotRoute("/yemot/ext1", async (c) => {
   if (!isAuthed(c)) return ivr("go_to_folder=/99");
 
   const raw = latest(c, "val_menu");
-  if (raw === undefined) return ivr(readCmd(MENU_PROMPT, "val_menu", { min: 2, max: 2 }));
+  if (raw === undefined) return ivr(readCmd(MENU_PROMPT, "val_menu", { min: 1, max: 1 }));
 
   const choice = decodeDtmf(raw).digits;
-  if (choice === "11") return ivr("go_to_folder=/1/1");
-  if (choice === "12") return ivr("go_to_folder=/1/2");
-  return ivr(say("בחירה לא חוקית"), readCmd(MENU_PROMPT, "val_menu", { min: 2, max: 2 }));
+  if (choice === "1") return ivr("go_to_folder=/1/1");
+  if (choice === "2") return ivr("go_to_folder=/1/2");
+  return ivr(say("בחירה לא חוקית"), readCmd(MENU_PROMPT, "val_menu", { min: 1, max: 1 }));
 });
 
-// ---------- Folder 1/1: code playback (menu 11) ----------
+// ---------- Folder 1/1: code playback (menu 1) ----------
 // Post-code menu: 1 repeat, 2 another slot, 9 back to main menu (/1).
 // Params: val_slot (first slot), val_slot2 (another slot), val_after (post-code menu answers).
 async function speakCode(user: Row, slot: number): Promise<Response> {
@@ -328,7 +328,7 @@ yemotRoute("/yemot/ext11", async (c) => {
   return ivr(say("להתראות"), hangup());
 });
 
-// ---------- Folder 1/2: seed input (menu 12) ----------
+// ---------- Folder 1/2: seed input (menu 2) ----------
 yemotRoute("/yemot/ext12", async (c) => {
   if (!isAuthed(c)) return ivr("go_to_folder=/99");
   return ivr(say("הזנת חשבון חדש אינה זמינה כרגע"), hangup());
