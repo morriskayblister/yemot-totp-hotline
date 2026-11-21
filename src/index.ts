@@ -105,9 +105,9 @@ export function decodeDtmf(raw: string | undefined): { digits: string; terminato
 }
 
 // ---------- Yemot response helpers ----------
-// Yemot expects plain-text lines; each line is one IVR instruction.
+// Yemot chains multiple instructions in one response with "&". Newlines are ignored after the first line.
 function ivr(...lines: string[]) {
-  const body = lines.join("\n");
+  const body = lines.join("&");
   console.log(JSON.stringify({ ev: "yemot_response", body }));
   return new Response(body, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
 }
@@ -120,7 +120,7 @@ function say(text: string) {
 // read=t-<prompt>=<val_name>,<re_enter_if_exists>,<max>,<min>,<sec_wait>,<typing_playback_mode>,<block_asterisk>,<block_zero>
 // Yemot calls this same URL again with the entered digits in a query parameter named <val_name>.
 function readCmd(prompt: string, valName: string, opts: { min: number; max: number; timeout?: number }) {
-  const safePrompt = prompt.replace(/[,=]/g, " ");
+  const safePrompt = prompt.replace(/[,=&]/g, " ");
   const timeout = opts.timeout ?? 10;
   return `read=t-${safePrompt}=${valName},no,${opts.max},${opts.min},${timeout},Digits,no,no`;
 }
@@ -136,7 +136,7 @@ async function handleYemot(c: Context) {
   }
 
   const phone = (c.req.query("ApiPhone") ?? "").replace(/\D/g, "");
-  if (!phone) return ivr(say("Caller ID missing, goodbye"), "hangup=yes");
+  if (!phone) return ivr(say("מספר המתקשר אינו זמין, להתראות"), "hangup=yes");
 
   const users = await sb(`auth_users?phone_number=eq.${phone}&select=*`);
   let user = users[0];
@@ -154,20 +154,20 @@ async function handleYemot(c: Context) {
     if (entered !== undefined) {
       const { digits } = decodeDtmf(entered);
       if (digits.length !== 4) {
-        return ivr(say("Invalid PIN"), readCmd("אנא בחר קוד סודי בן 4 ספרות", "pin_set", { min: 4, max: 4, timeout: 10 }));
+        return ivr(say("קוד לא תקין"), readCmd("אנא בחר קוד סודי בן 4 ספרות", "pin_set", { min: 4, max: 4, timeout: 10 }));
       }
       const salt = crypto.randomUUID().slice(0, 8);
       await sb(`auth_users?id=eq.${user.id}`, {
         method: "PATCH",
         body: JSON.stringify({ pin_hash: await hashPin(digits, salt), pin_failures: 0, pin_locked_until: null }),
       });
-      return ivr(say("PIN saved"), readCmd("לקודים הקש 1, להוספת חשבון הקש 2", "menu", { min: 1, max: 1 }));
+      return ivr(say("הקוד נשמר בהצלחה"), readCmd("לקודים הקש 1, להוספת חשבון הקש 2", "menu", { min: 1, max: 1 }));
     }
     return ivr(readCmd("שלום אנא בחר קוד סודי בן 4 ספרות", "pin_set", { min: 4, max: 4, timeout: 10 }));
   }
 
   if (user.pin_locked_until && new Date(user.pin_locked_until) > new Date()) {
-    return ivr(say("Too many attempts, try again later"), "hangup=yes");
+    return ivr(say("יותר מדי ניסיונות, נסו שוב מאוחר יותר"), "hangup=yes");
   }
 
   // Login PIN entered
@@ -181,8 +181,8 @@ async function handleYemot(c: Context) {
         method: "PATCH",
         body: JSON.stringify({ pin_failures: lock ? 0 : failures, pin_locked_until: lock }),
       });
-      if (lock) return ivr(say("Too many attempts, try again later"), "hangup=yes");
-      return ivr(say("Wrong PIN"), readCmd("אנא הקש קוד סודי", "pin", { min: 4, max: 4, timeout: 10 }));
+      if (lock) return ivr(say("יותר מדי ניסיונות, נסו שוב מאוחר יותר"), "hangup=yes");
+      return ivr(say("הקוד שגוי"), readCmd("אנא הקש קוד סודי", "pin", { min: 4, max: 4, timeout: 10 }));
     }
     await sb(`auth_users?id=eq.${user.id}`, { method: "PATCH", body: JSON.stringify({ pin_failures: 0 }) });
     return ivr(readCmd("לקודים הקש 1, להוספת חשבון הקש 2", "menu", { min: 1, max: 1 }));
@@ -193,8 +193,8 @@ async function handleYemot(c: Context) {
   if (menuIn !== undefined) {
     const choice = decodeDtmf(menuIn).digits;
     if (choice === "1") return ivr(readCmd("הקש מספר משבצת", "slot", { min: 1, max: 2 }));
-    if (choice === "2") return ivr(say("Adding accounts by phone is not available yet"), "hangup=yes");
-    return ivr(say("Invalid choice"), "hangup=yes");
+    if (choice === "2") return ivr(say("הוספת חשבונות בטלפון אינה זמינה כרגע"), "hangup=yes");
+    return ivr(say("בחירה לא חוקית"), "hangup=yes");
   }
 
   // Account slot chosen: read the TOTP code
@@ -202,9 +202,9 @@ async function handleYemot(c: Context) {
   if (slotIn !== undefined) {
     const slot = Number(decodeDtmf(slotIn).digits);
     const accounts = await sb(`totp_accounts?user_id=eq.${user.id}&slot_number=eq.${slot}&select=*`);
-    if (!accounts[0]) return ivr(say("No account in that slot"), "hangup=yes");
+    if (!accounts[0]) return ivr(say("אין חשבון במשבצת זו"), "hangup=yes");
     const code = await totp(accounts[0].totp_secret, accounts[0].digits, accounts[0].period);
-    return ivr(say(`Your code is ${code.split("").join(" ")}`), "hangup=yes");
+    return ivr(say(`הקוד שלך הוא ${code.split("").join(" ")}`), "hangup=yes");
   }
 
   // Default: ask for PIN
@@ -216,7 +216,7 @@ app.get("/yemot", async (c) => {
     return await handleYemot(c);
   } catch (err) {
     console.error(JSON.stringify({ ev: "error", message: String(err) }));
-    return ivr(say("System error, please try again later"), "hangup=yes");
+    return ivr(say("שגיאת מערכת, נסו שוב מאוחר יותר"), "hangup=yes");
   }
 });
 
