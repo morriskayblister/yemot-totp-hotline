@@ -117,12 +117,20 @@ function say(text: string) {
 }
 
 // Yemot read command, field order from the official API module doc:
-// read=t-<prompt>=<val_name>,<re_enter_if_exists>,<max>,<min>,<sec_wait>,<typing_playback_mode>,<block_asterisk>,<block_zero>
+// 1 val_name, 2 re_enter_if_exists, 3 max, 4 min, 5 timeout, 6 typing_playback_mode,
+// 7 block_asterisk, 8 block_zero, 9-14 defaults (empty), 15 request_confirmation (no = do not ask caller to confirm each keypress).
 // Yemot calls this same URL again with the entered digits in a query parameter named <val_name>.
 function readCmd(prompt: string, valName: string, opts: { min: number; max: number; timeout?: number }) {
   const safePrompt = prompt.replace(/[,=&]/g, " ");
   const timeout = opts.timeout ?? 10;
-  return `read=t-${safePrompt}=${valName},no,${opts.max},${opts.min},${timeout},Digits,no,no`;
+  return `read=t-${safePrompt}=${valName},no,${opts.max},${opts.min},${timeout},Digits,no,no,,,,,,,no`;
+}
+
+// Yemot accumulates every earlier answer in later requests, so a param can be an array.
+// The most recent answer is the last element.
+function latest(c: Context, name: string): string | undefined {
+  const all = c.req.queries(name);
+  return all && all.length ? all[all.length - 1] : undefined;
 }
 
 // ---------- IVR flow ----------
@@ -150,7 +158,7 @@ async function handleYemot(c: Context) {
 
   // PIN not set yet (new caller, or existing row with empty pin_hash): set it right here.
   if (!user.pin_hash) {
-    const entered = c.req.query("pin_set");
+    const entered = latest(c, "pin_set");
     if (entered !== undefined) {
       const { digits } = decodeDtmf(entered);
       if (digits.length !== 4) {
@@ -170,8 +178,27 @@ async function handleYemot(c: Context) {
     return ivr(say("יותר מדי ניסיונות, נסו שוב מאוחר יותר"), "hangup=yes");
   }
 
+  // Account slot chosen: read the TOTP code. Checked first, because later reads carry earlier answers.
+  const slotIn = latest(c, "slot");
+  if (slotIn !== undefined) {
+    const slot = Number(decodeDtmf(slotIn).digits);
+    const accounts = await sb(`totp_accounts?user_id=eq.${user.id}&slot_number=eq.${slot}&select=*`);
+    if (!accounts[0]) return ivr(say("אין חשבון במשבצת זו"), "hangup=yes");
+    const code = await totp(accounts[0].totp_secret, accounts[0].digits, accounts[0].period);
+    return ivr(say(`הקוד שלך הוא ${code.split("").join(" ")}`), "hangup=yes");
+  }
+
+  // Menu choice
+  const menuIn = latest(c, "menu");
+  if (menuIn !== undefined) {
+    const choice = decodeDtmf(menuIn).digits;
+    if (choice === "1") return ivr(readCmd("הקש מספר משבצת", "slot", { min: 1, max: 2 }));
+    if (choice === "2") return ivr(say("הוספת חשבונות בטלפון אינה זמינה כרגע"), "hangup=yes");
+    return ivr(say("בחירה לא חוקית"), "hangup=yes");
+  }
+
   // Login PIN entered
-  const pinIn = c.req.query("pin");
+  const pinIn = latest(c, "pin");
   if (pinIn !== undefined) {
     const { digits } = decodeDtmf(pinIn);
     if (!(await verifyPin(digits, user.pin_hash))) {
@@ -186,25 +213,6 @@ async function handleYemot(c: Context) {
     }
     await sb(`auth_users?id=eq.${user.id}`, { method: "PATCH", body: JSON.stringify({ pin_failures: 0 }) });
     return ivr(readCmd("לקודים הקש 1, להוספת חשבון הקש 2", "menu", { min: 1, max: 1 }));
-  }
-
-  // Menu choice
-  const menuIn = c.req.query("menu");
-  if (menuIn !== undefined) {
-    const choice = decodeDtmf(menuIn).digits;
-    if (choice === "1") return ivr(readCmd("הקש מספר משבצת", "slot", { min: 1, max: 2 }));
-    if (choice === "2") return ivr(say("הוספת חשבונות בטלפון אינה זמינה כרגע"), "hangup=yes");
-    return ivr(say("בחירה לא חוקית"), "hangup=yes");
-  }
-
-  // Account slot chosen: read the TOTP code
-  const slotIn = c.req.query("slot");
-  if (slotIn !== undefined) {
-    const slot = Number(decodeDtmf(slotIn).digits);
-    const accounts = await sb(`totp_accounts?user_id=eq.${user.id}&slot_number=eq.${slot}&select=*`);
-    if (!accounts[0]) return ivr(say("אין חשבון במשבצת זו"), "hangup=yes");
-    const code = await totp(accounts[0].totp_secret, accounts[0].digits, accounts[0].period);
-    return ivr(say(`הקוד שלך הוא ${code.split("").join(" ")}`), "hangup=yes");
   }
 
   // Default: ask for PIN
