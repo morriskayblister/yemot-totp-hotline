@@ -328,10 +328,90 @@ yemotRoute("/yemot/ext11", async (c) => {
   return ivr(say("להתראות"), hangup());
 });
 
-// ---------- Folder 1/2: seed input (menu 2) ----------
+// ---------- Folder 1/2: TOTP seed entry by keypad ----------
+// Keypad encoding (2 digits per character, * = backspace, # = end):
+//   00-09 = digits 0-9, 21-23 = A-C, 31-33 = D-F, 41-43 = G-I, 51-53 = J-L,
+//   61-63 = M-O, 71-74 = P-S, 81-83 = T-V, 91-94 = W-Z.
+// Only A-Z and 2-7 are valid base32, so 0, 1, 8 and 9 are rejected at validation.
+const DTMF_LETTERS: Record<string, string> = {
+  "21": "A", "22": "B", "23": "C",
+  "31": "D", "32": "E", "33": "F",
+  "41": "G", "42": "H", "43": "I",
+  "51": "J", "52": "K", "53": "L",
+  "61": "M", "62": "N", "63": "O",
+  "71": "P", "72": "Q", "73": "R", "74": "S",
+  "81": "T", "82": "U", "83": "V",
+  "91": "W", "92": "X", "93": "Y", "94": "Z",
+};
+const MIN_SEED_LENGTH = 16;
+const SEED_PROMPT = "אנא הקש את מפתח האימות ולאחריו סולמית";
+const SEED_READ = { min: 2, max: 100, timeout: 30 };
+
+// Converts the raw keypad string into a validated base32 seed, or null if it is not usable.
+async function decodeSeedDtmf(raw: string): Promise<string | null> {
+  const s = raw.replace(/\s/g, "").replace(/#+$/, "");
+  let out = "";
+  for (let i = 0; i < s.length; ) {
+    if (s[i] === "*") {
+      out = out.slice(0, -1);
+      i += 1;
+      continue;
+    }
+    const pair = s.slice(i, i + 2);
+    if (!/^\d\d$/.test(pair)) return null;
+    if (pair[0] === "0") {
+      out += pair[1];
+    } else {
+      const letter = DTMF_LETTERS[pair];
+      if (!letter) return null;
+      out += letter;
+    }
+    i += 2;
+  }
+  const seed = out.toUpperCase();
+  if (seed.length < MIN_SEED_LENGTH || !/^[A-Z2-7]+$/.test(seed)) return null;
+  try {
+    await totp(seed);
+  } catch {
+    return null;
+  }
+  return seed;
+}
+
 yemotRoute("/yemot/ext12", async (c) => {
   if (!isAuthed(c)) return ivr("go_to_folder=/99");
-  return ivr(say("הזנת חשבון חדש אינה זמינה כרגע"), hangup());
+  const phone = callerPhone(c);
+  if (!phone) return ivr(say("מספר המתקשר אינו זמין, להתראות"), hangup());
+
+  const raw = latest(c, "val_seed_raw");
+  if (raw === undefined) return ivr(readCmd(SEED_PROMPT, "val_seed_raw", SEED_READ));
+
+  const seed = await decodeSeedDtmf(raw);
+  if (!seed) {
+    return ivr(say("המפתח שהוקש אינו תקין"), readCmd(SEED_PROMPT, "val_seed_raw", SEED_READ));
+  }
+
+  const user = await loadUser(phone);
+  const existing: Row[] = await sb(`totp_accounts?user_id=eq.${user.id}&select=slot_number,totp_secret`);
+  if (existing.some((a) => a.totp_secret === seed)) {
+    return ivr(say("המפתח כבר שמור במערכת"), "go_to_folder=/1");
+  }
+
+  const used = new Set(existing.map((a) => Number(a.slot_number)));
+  let slot = 0;
+  for (let n = 1; n <= 9; n++) {
+    if (!used.has(n)) {
+      slot = n;
+      break;
+    }
+  }
+  if (!slot) return ivr(say("אין משבצת פנויה"), "go_to_folder=/1");
+
+  await sb("totp_accounts", {
+    method: "POST",
+    body: JSON.stringify({ user_id: user.id, slot_number: slot, totp_secret: seed, digits: 6, period: 30, algorithm: "SHA1" }),
+  });
+  return ivr(say("המפתח נשמר בהצלחה במשבצת"), `id_list_message=d-${slot}`, "go_to_folder=/1");
 });
 
 app.get("/health", (c) => c.json({ ok: true }));
