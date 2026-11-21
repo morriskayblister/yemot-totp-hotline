@@ -1,4 +1,4 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 
 // Environment: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, PORT (optional)
 const SUPABASE_URL = process.env.SUPABASE_URL ?? "";
@@ -7,6 +7,24 @@ const MAX_PIN_FAILURES = 3;
 const LOCK_MINUTES = 15;
 
 const app = new Hono();
+
+// ---------- Request logging ----------
+app.use("*", async (c, next) => {
+  const started = Date.now();
+  await next();
+  console.log(
+    JSON.stringify({
+      ev: "request",
+      method: c.req.method,
+      path: c.req.path,
+      query: c.req.queries(),
+      status: c.res.status,
+      ms: Date.now() - started,
+      ip: c.req.header("x-forwarded-for") ?? null,
+      ua: c.req.header("user-agent") ?? null,
+    }),
+  );
+});
 
 // ---------- Supabase REST helpers (service role, bypasses RLS) ----------
 async function sb(path: string, init: RequestInit = {}) {
@@ -89,52 +107,66 @@ export function decodeDtmf(raw: string | undefined): { digits: string; terminato
 // ---------- Yemot response helpers ----------
 // Yemot expects plain-text lines; each line is one IVR instruction.
 function ivr(...lines: string[]) {
-  return new Response(lines.join("\n"), { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+  const body = lines.join("\n");
+  console.log(JSON.stringify({ ev: "yemot_response", body }));
+  return new Response(body, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
 }
 
 function say(text: string) {
   return `id_list_message=t-${text}`;
 }
 
-// ---------- IVR flow ----------
-// Query params from Yemot: ApiPhone (caller), val (DTMF input), step (flow step), slot (account slot)
-app.get("/yemot", async (c) => {
-  const phone = (c.req.query("ApiPhone") ?? "").replace(/\D/g, "");
-  const step = c.req.query("step") ?? "menu";
-  const { digits, terminator } = decodeDtmf(c.req.query("val"));
+// Yemot read command:
+// read=t-<prompt>=<varName>,<timeout>,<min>,<max>,<digits_type>,<voice>,<file>,<enter_if_empty>
+// Yemot calls this same URL again with the entered digits in a query parameter named <varName>.
+function readCmd(prompt: string, varName: string, min: number, max: number, timeout = 10) {
+  const safePrompt = prompt.replace(/[,=]/g, " ");
+  return `read=t-${safePrompt}=${varName},${timeout},${min},${max},SecDigits,no,,yes`;
+}
 
+// ---------- IVR flow ----------
+// Query params from Yemot: ApiPhone (caller). Read results come back as params named after the read variable:
+// pin_set (new PIN), pin (login PIN), menu (menu choice), slot (account slot).
+async function handleYemot(c: Context) {
+  const phone = (c.req.query("ApiPhone") ?? "").replace(/\D/g, "");
   if (!phone) return ivr(say("Caller ID missing, goodbye"), "hangup=yes");
 
   const users = await sb(`auth_users?phone_number=eq.${phone}&select=*`);
   let user = users[0];
-
-  // First call: register caller and ask them to set a PIN.
   if (!user) {
     const created = await sb("auth_users", {
       method: "POST",
       body: JSON.stringify({ phone_number: phone }),
     });
     user = created[0];
-    return ivr(say("Welcome. Enter a PIN of 4 digits followed by the pound key"), `read=pin_set=sec_pin_set,,,4,4,7,no,,yes,,`);
   }
 
-  if (step === "pin_set") {
-    if (digits.length !== 4 || terminator !== "#") return ivr(say("Invalid PIN"), "go_to_folder=/");
-    const salt = crypto.randomUUID().slice(0, 8);
-    await sb(`auth_users?id=eq.${user.id}`, {
-      method: "PATCH",
-      body: JSON.stringify({ pin_hash: await hashPin(digits, salt), pin_failures: 0 }),
-    });
-    return ivr(say("PIN saved"), "go_to_folder=/");
+  // PIN not set yet (new caller, or existing row with empty pin_hash): set it right here.
+  if (!user.pin_hash) {
+    const entered = c.req.query("pin_set");
+    if (entered !== undefined) {
+      const { digits } = decodeDtmf(entered);
+      if (digits.length !== 4) {
+        return ivr(say("Invalid PIN"), readCmd("Please choose a 4 digit PIN followed by pound", "pin_set", 4, 4));
+      }
+      const salt = crypto.randomUUID().slice(0, 8);
+      await sb(`auth_users?id=eq.${user.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ pin_hash: await hashPin(digits, salt), pin_failures: 0, pin_locked_until: null }),
+      });
+      return ivr(say("PIN saved"), readCmd("Press 1 for codes, 2 to add an account", "menu", 1, 1));
+    }
+    return ivr(readCmd("Welcome. Please choose a 4 digit PIN followed by pound", "pin_set", 4, 4));
   }
-
-  if (!user.pin_hash) return ivr(say("Please set a PIN first"), "go_to_folder=/");
 
   if (user.pin_locked_until && new Date(user.pin_locked_until) > new Date()) {
     return ivr(say("Too many attempts, try again later"), "hangup=yes");
   }
 
-  if (step === "pin") {
+  // Login PIN entered
+  const pinIn = c.req.query("pin");
+  if (pinIn !== undefined) {
+    const { digits } = decodeDtmf(pinIn);
     if (!(await verifyPin(digits, user.pin_hash))) {
       const failures = (user.pin_failures ?? 0) + 1;
       const lock = failures >= MAX_PIN_FAILURES ? new Date(Date.now() + LOCK_MINUTES * 60_000).toISOString() : null;
@@ -142,26 +174,43 @@ app.get("/yemot", async (c) => {
         method: "PATCH",
         body: JSON.stringify({ pin_failures: lock ? 0 : failures, pin_locked_until: lock }),
       });
-      return ivr(say("Wrong PIN"), "go_to_folder=/");
+      if (lock) return ivr(say("Too many attempts, try again later"), "hangup=yes");
+      return ivr(say("Wrong PIN"), readCmd("Enter your PIN followed by pound", "pin", 4, 4));
     }
     await sb(`auth_users?id=eq.${user.id}`, { method: "PATCH", body: JSON.stringify({ pin_failures: 0 }) });
-    return ivr(say("Press 1 for codes, 2 to add an account"), "read=menu=sec_menu,,,1,1,7,no,,yes,,");
+    return ivr(readCmd("Press 1 for codes, 2 to add an account", "menu", 1, 1));
   }
 
-  // Menu / code flow
-  if (step === "menu") {
-    return ivr(say("Enter your PIN followed by the pound key"), "read=pin=sec_pin,,,4,4,7,no,,yes,,");
+  // Menu choice
+  const menuIn = c.req.query("menu");
+  if (menuIn !== undefined) {
+    const choice = decodeDtmf(menuIn).digits;
+    if (choice === "1") return ivr(readCmd("Enter the account slot", "slot", 1, 2));
+    if (choice === "2") return ivr(say("Adding accounts by phone is not available yet"), "hangup=yes");
+    return ivr(say("Invalid choice"), "hangup=yes");
   }
 
-  if (step === "code") {
-    const slot = Number(c.req.query("slot") ?? "");
+  // Account slot chosen: read the TOTP code
+  const slotIn = c.req.query("slot");
+  if (slotIn !== undefined) {
+    const slot = Number(decodeDtmf(slotIn).digits);
     const accounts = await sb(`totp_accounts?user_id=eq.${user.id}&slot_number=eq.${slot}&select=*`);
-    if (!accounts[0]) return ivr(say("No account in that slot"), "go_to_folder=/");
+    if (!accounts[0]) return ivr(say("No account in that slot"), "hangup=yes");
     const code = await totp(accounts[0].totp_secret, accounts[0].digits, accounts[0].period);
-    return ivr(say(`Your code is ${code.split("").join(" ")}`), "go_to_folder=/");
+    return ivr(say(`Your code is ${code.split("").join(" ")}`), "hangup=yes");
   }
 
-  return ivr(say("Goodbye"), "hangup=yes");
+  // Default: ask for PIN
+  return ivr(readCmd("Enter your PIN followed by pound", "pin", 4, 4));
+}
+
+app.get("/yemot", async (c) => {
+  try {
+    return await handleYemot(c);
+  } catch (err) {
+    console.error(JSON.stringify({ ev: "error", message: String(err) }));
+    return ivr(say("System error, please try again later"), "hangup=yes");
+  }
 });
 
 app.get("/health", (c) => c.json({ ok: true }));
