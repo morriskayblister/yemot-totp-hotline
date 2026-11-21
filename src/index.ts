@@ -5,6 +5,9 @@ const SUPABASE_URL = process.env.SUPABASE_URL ?? "";
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
 const MAX_PIN_FAILURES = 3;
 const LOCK_MINUTES = 15;
+const SESSION_TTL_MS = 15 * 60_000;
+
+type Row = Record<string, any>;
 
 const app = new Hono();
 
@@ -20,14 +23,40 @@ app.use("*", async (c, next) => {
       query: c.req.queries(),
       status: c.res.status,
       ms: Date.now() - started,
-      ip: c.req.header("x-forwarded-for") ?? null,
-      ua: c.req.header("user-agent") ?? null,
     }),
   );
 });
 
+// ---------- In-memory call sessions (keyed by Yemot ApiCallId; lost on restart) ----------
+type CallSession = { phone: string; authed: boolean; time: number };
+const callSessions = new Map<string, CallSession>();
+
+function sweepSessions(now: number): void {
+  for (const [id, s] of callSessions) {
+    if (now - s.time > SESSION_TTL_MS) callSessions.delete(id);
+  }
+}
+
+function callId(c: Context): string {
+  return c.req.query("ApiCallId") ?? "";
+}
+
+// True when this call was authenticated and its session has not expired. Each check slides the expiry.
+function isAuthed(c: Context): boolean {
+  const now = Date.now();
+  sweepSessions(now);
+  const s = callSessions.get(callId(c));
+  if (!s || !s.authed) return false;
+  s.time = now;
+  return true;
+}
+
+function markAuthed(c: Context, phone: string): void {
+  callSessions.set(callId(c), { phone, authed: true, time: Date.now() });
+}
+
 // ---------- Supabase REST helpers (service role, bypasses RLS) ----------
-async function sb(path: string, init: RequestInit = {}) {
+async function sb(path: string, init: RequestInit = {}): Promise<any> {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
     ...init,
     headers: {
@@ -42,10 +71,20 @@ async function sb(path: string, init: RequestInit = {}) {
   return res.json();
 }
 
+// Loads the caller's row, creating it on first contact.
+async function loadUser(phone: string): Promise<Row> {
+  const users: Row[] = await sb(`auth_users?phone_number=eq.${phone}&select=*`);
+  if (users[0]) return users[0];
+  const created: Row[] = await sb("auth_users", {
+    method: "POST",
+    body: JSON.stringify({ phone_number: phone }),
+  });
+  return created[0];
+}
+
 // ---------- PIN hashing (SHA-256 with salt; use a KDF in production) ----------
 async function hashPin(pin: string, salt: string): Promise<string> {
-  const data = new TextEncoder().encode(`${salt}:${pin}`);
-  const digest = await crypto.subtle.digest("SHA-256", data);
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${salt}:${pin}`));
   return `${salt}$${Buffer.from(digest).toString("hex")}`;
 }
 
@@ -78,57 +117,48 @@ async function totp(secret: string, digits = 6, period = 30, nowMs = Date.now())
   const counter = Math.floor(nowMs / 1000 / period);
   const msg = new ArrayBuffer(8);
   new DataView(msg).setBigUint64(0, BigInt(counter));
-  const key = await crypto.subtle.importKey(
-    "raw",
-    base32Decode(secret),
-    { name: "HMAC", hash: "SHA-1" },
-    false,
-    ["sign"],
-  );
+  const key = await crypto.subtle.importKey("raw", base32Decode(secret), { name: "HMAC", hash: "SHA-1" }, false, [
+    "sign",
+  ]);
   const h = new Uint8Array(await crypto.subtle.sign("HMAC", key, msg));
   const offset = h[h.length - 1] & 0x0f;
   const code =
-    ((h[offset] & 0x7f) << 24) |
-    ((h[offset + 1] & 0xff) << 16) |
-    ((h[offset + 2] & 0xff) << 8) |
-    (h[offset + 3] & 0xff);
+    ((h[offset] & 0x7f) << 24) | ((h[offset + 1] & 0xff) << 16) | ((h[offset + 2] & 0xff) << 8) | (h[offset + 3] & 0xff);
   return (code % 10 ** digits).toString().padStart(digits, "0");
 }
 
 // ---------- DTMF decoding ----------
-// Yemot passes keypad input as a string of digits; "*" and "#" are control keys.
 export function decodeDtmf(raw: string | undefined): { digits: string; terminator: "#" | null } {
   const value = (raw ?? "").trim();
-  const terminator = value.endsWith("#") ? "#" : null;
-  const digits = value.replace(/[^0-9]/g, "");
-  return { digits, terminator };
+  return { digits: value.replace(/[^0-9]/g, ""), terminator: value.endsWith("#") ? "#" : null };
 }
 
 // ---------- Yemot response helpers ----------
-// Yemot chains multiple instructions in one response with "&". Newlines are ignored after the first line.
-function ivr(...lines: string[]) {
+// Yemot chains instructions in one response with "&".
+function ivr(...lines: string[]): Response {
   const body = lines.join("&");
   console.log(JSON.stringify({ ev: "yemot_response", body }));
   return new Response(body, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
 }
 
-function say(text: string) {
+function say(text: string): string {
   return `id_list_message=t-${text}`;
 }
 
-// Yemot read command, field order from the official API module doc:
-// 1 val_name, 2 re_enter_if_exists, 3 max, 4 min, 5 timeout, 6 typing_playback_mode,
-// 7 block_asterisk, 8 block_zero, 9-14 defaults (empty), 15 request_confirmation (no = do not ask caller to confirm each keypress).
-// Field 6 is "No" so Yemot does not read back each keypress.
-// Yemot calls this same URL again with the entered digits in a query parameter named <val_name>.
-function readCmd(prompt: string, valName: string, opts: { min: number; max: number; timeout?: number }) {
-  const safePrompt = prompt.replace(/[,=&]/g, " ");
-  const timeout = opts.timeout ?? 10;
-  return `read=t-${safePrompt}=${valName},no,${opts.max},${opts.min},${timeout},No,no,no,,,,,,,no`;
+function hangup(): string {
+  return "hangup=yes";
 }
 
-// Yemot accumulates every earlier answer in later requests, so a param can be an array.
-// The most recent answer is the last element.
+// Yemot read command. Field order from the official API doc:
+// 1 val_name, 2 re_enter_if_exists, 3 max, 4 min, 5 timeout, 6 typing_playback_mode,
+// 7 block_asterisk, 8 block_zero, 9-14 defaults, 15 request_confirmation (no).
+// Yemot calls the same URL again with the entered digits in a param named <val_name>.
+function readCmd(prompt: string, valName: string, opts: { min: number; max: number; timeout?: number }): string {
+  const safePrompt = prompt.replace(/[,=&]/g, " ");
+  return `read=t-${safePrompt}=${valName},no,${opts.max},${opts.min},${opts.timeout ?? 10},No,no,no,,,,,,,no`;
+}
+
+// Yemot accumulates earlier answers in later requests, so a param can be an array. The last element is newest.
 function all(c: Context, name: string): string[] {
   return c.req.queries(name) ?? [];
 }
@@ -138,138 +168,170 @@ function latest(c: Context, name: string): string | undefined {
   return list.length ? list[list.length - 1] : undefined;
 }
 
-// ---------- IVR flow ----------
-// Query params from Yemot: ApiPhone (caller). Read results come back as params named after the read val_name:
-// pin_set (new PIN), pin (login PIN), menu (menu choice), slot (account slot), slot2 (account slot after choosing another slot),
-// after (choice after the code: 1 repeat, 2 another slot, 9 hang up).
-//
-// Counting rule for the code flow (no ordering info across param names, so counts are used):
-//   s = slot entries (slot + slot2), a = after answers, two = after answers equal to "2".
-//   - two > slot2 count: caller chose another slot, read slot2 now.
-//   - s > a: a new slot was entered and its code is not spoken yet, speak it and offer the after menu.
-//   - a > 0: answer to the after menu: 1 replays the current code, anything else hangs up.
-async function handleYemot(c: Context) {
-  // Yemot sends hangup=yes when the caller disconnects. Nothing to say; return an empty body.
-  if (c.req.query("hangup") === "yes") {
-    console.log(JSON.stringify({ ev: "hangup", query: c.req.queries() }));
-    return new Response("", { headers: { "Content-Type": "text/plain; charset=utf-8" } });
-  }
-
-  const phone = (c.req.query("ApiPhone") ?? "").replace(/\D/g, "");
-  if (!phone) return ivr(say("מספר המתקשר אינו זמין, להתראות"), "hangup=yes");
-
-  const users = await sb(`auth_users?phone_number=eq.${phone}&select=*`);
-  let user = users[0];
-  if (!user) {
-    const created = await sb("auth_users", {
-      method: "POST",
-      body: JSON.stringify({ phone_number: phone }),
-    });
-    user = created[0];
-  }
-
-  // PIN not set yet (new caller, or existing row with empty pin_hash): set it right here.
-  if (!user.pin_hash) {
-    const entered = latest(c, "pin_set");
-    if (entered !== undefined) {
-      const { digits } = decodeDtmf(entered);
-      if (digits.length !== 4) {
-        return ivr(say("קוד לא תקין"), readCmd("אנא בחר קוד סודי בן 4 ספרות", "pin_set", { min: 4, max: 4, timeout: 10 }));
-      }
-      const salt = crypto.randomUUID().slice(0, 8);
-      await sb(`auth_users?id=eq.${user.id}`, {
-        method: "PATCH",
-        body: JSON.stringify({ pin_hash: await hashPin(digits, salt), pin_failures: 0, pin_locked_until: null }),
-      });
-      return ivr(say("הקוד נשמר בהצלחה"), readCmd("לקודים הקש 1, להוספת חשבון הקש 2", "menu", { min: 1, max: 1 }));
-    }
-    return ivr(readCmd("שלום אנא בחר קוד סודי בן 4 ספרות", "pin_set", { min: 4, max: 4, timeout: 10 }));
-  }
-
-  if (user.pin_locked_until && new Date(user.pin_locked_until) > new Date()) {
-    return ivr(say("יותר מדי ניסיונות, נסו שוב מאוחר יותר"), "hangup=yes");
-  }
-
-  // Code flow: slot / slot2 / after params.
-  const slotAll = all(c, "slot");
-  const slot2All = all(c, "slot2");
-  const afterAll = all(c, "after");
-  const s = slotAll.length + slot2All.length;
-  const a = afterAll.length;
-  const two = afterAll.filter((v) => decodeDtmf(v).digits === "2").length;
-
-  if (s > 0 || a > 0) {
-    // Caller pressed 2 on the after menu: read another slot number.
-    if (two > slot2All.length) {
-      return ivr(readCmd("הקש מספר משבצת", "slot2", { min: 1, max: 2 }));
-    }
-    const currentSlotRaw = slot2All.length > 0 ? latest(c, "slot2") : latest(c, "slot");
-    // A new slot was entered and its code is not spoken yet.
-    if (s > a) {
-      const slot = Number(decodeDtmf(currentSlotRaw).digits);
-      const accounts = await sb(`totp_accounts?user_id=eq.${user.id}&slot_number=eq.${slot}&select=*`);
-      if (!accounts[0]) return ivr(say("אין חשבון במשבצת זו"), "hangup=yes");
-      const code = await totp(accounts[0].totp_secret, accounts[0].digits, accounts[0].period);
-      return ivr(
-        say("הקוד שלך הוא"),
-        `id_list_message=d-${code}`,
-        readCmd("לשמיעה חוזרת הקש 1, למשבצת אחרת הקש 2, לניתוק הקש 9", "after", { min: 1, max: 1 }),
-      );
-    }
-    // Answer to the after menu.
-    const after = decodeDtmf(latest(c, "after")).digits;
-    if (after === "1") {
-      const slot = Number(decodeDtmf(currentSlotRaw).digits);
-      const accounts = await sb(`totp_accounts?user_id=eq.${user.id}&slot_number=eq.${slot}&select=*`);
-      if (!accounts[0]) return ivr(say("אין חשבון במשבצת זו"), "hangup=yes");
-      const code = await totp(accounts[0].totp_secret, accounts[0].digits, accounts[0].period);
-      return ivr(
-        say("הקוד שלך הוא"),
-        `id_list_message=d-${code}`,
-        readCmd("לשמיעה חוזרת הקש 1, למשבצת אחרת הקש 2, לניתוק הקש 9", "after", { min: 1, max: 1 }),
-      );
-    }
-    return ivr(say("להתראות"), "hangup=yes");
-  }
-
-  // Menu choice
-  const menuIn = latest(c, "menu");
-  if (menuIn !== undefined) {
-    const choice = decodeDtmf(menuIn).digits;
-    if (choice === "1") return ivr(readCmd("הקש מספר משבצת", "slot", { min: 1, max: 2 }));
-    if (choice === "2") return ivr(say("הוספת חשבונות בטלפון אינה זמינה כרגע"), "hangup=yes");
-    return ivr(say("בחירה לא חוקית"), "hangup=yes");
-  }
-
-  // Login PIN entered
-  const pinIn = latest(c, "pin");
-  if (pinIn !== undefined) {
-    const { digits } = decodeDtmf(pinIn);
-    if (!(await verifyPin(digits, user.pin_hash))) {
-      const failures = (user.pin_failures ?? 0) + 1;
-      const lock = failures >= MAX_PIN_FAILURES ? new Date(Date.now() + LOCK_MINUTES * 60_000).toISOString() : null;
-      await sb(`auth_users?id=eq.${user.id}`, {
-        method: "PATCH",
-        body: JSON.stringify({ pin_failures: lock ? 0 : failures, pin_locked_until: lock }),
-      });
-      if (lock) return ivr(say("יותר מדי ניסיונות, נסו שוב מאוחר יותר"), "hangup=yes");
-      return ivr(say("הקוד שגוי"), readCmd("אנא הקש קוד סודי", "pin", { min: 4, max: 4, timeout: 10 }));
-    }
-    await sb(`auth_users?id=eq.${user.id}`, { method: "PATCH", body: JSON.stringify({ pin_failures: 0 }) });
-    return ivr(readCmd("לקודים הקש 1, להוספת חשבון הקש 2", "menu", { min: 1, max: 1 }));
-  }
-
-  // Default: ask for PIN
-  return ivr(readCmd("אנא הקש קוד סודי", "pin", { min: 4, max: 4, timeout: 10 }));
+function callerPhone(c: Context): string {
+  return (c.req.query("ApiPhone") ?? "").replace(/\D/g, "");
 }
 
-app.get("/yemot", async (c) => {
-  try {
-    return await handleYemot(c);
-  } catch (err) {
-    console.error(JSON.stringify({ ev: "error", message: String(err) }));
-    return ivr(say("שגיאת מערכת, נסו שוב מאוחר יותר"), "hangup=yes");
+const TEXT_HEADERS = { "Content-Type": "text/plain; charset=utf-8" };
+
+// Wraps every Yemot route: handles hangup, catches errors, and never leaves the caller without a reply.
+function yemotRoute(path: string, handler: (c: Context) => Promise<Response>): void {
+  app.get(path, async (c) => {
+    try {
+      if (c.req.query("hangup") === "yes") {
+        callSessions.delete(callId(c));
+        console.log(JSON.stringify({ ev: "hangup", path }));
+        return new Response("", { headers: TEXT_HEADERS });
+      }
+      return await handler(c);
+    } catch (err) {
+      console.error(JSON.stringify({ ev: "error", path, message: String(err) }));
+      return ivr(say("שגיאת מערכת, נסו שוב מאוחר יותר"), hangup());
+    }
+  });
+}
+
+// ---------- Root /yemot: gate into the system ----------
+yemotRoute("/yemot", async (c) => {
+  return ivr(isAuthed(c) ? "go_to_folder=/1" : "go_to_folder=/99");
+});
+
+// ---------- Extension 99: router by PIN state ----------
+yemotRoute("/yemot/ext99", async (c) => {
+  const phone = callerPhone(c);
+  if (!phone) return ivr(say("מספר המתקשר אינו זמין, להתראות"), hangup());
+  const user = await loadUser(phone);
+  return ivr(user.pin_hash ? "go_to_folder=/998" : "go_to_folder=/999");
+});
+
+// ---------- Extension 998: verify existing PIN ----------
+yemotRoute("/yemot/ext998", async (c) => {
+  const phone = callerPhone(c);
+  if (!phone) return ivr(say("מספר המתקשר אינו זמין, להתראות"), hangup());
+  const user = await loadUser(phone);
+  if (!user.pin_hash) return ivr("go_to_folder=/999");
+
+  if (user.pin_locked_until && new Date(user.pin_locked_until) > new Date()) {
+    return ivr(say("יותר מדי ניסיונות, נסו שוב מאוחר יותר"), hangup());
   }
+
+  const entered = latest(c, "val_pin");
+  if (entered === undefined) {
+    return ivr(readCmd("אנא הקש קוד סודי", "val_pin", { min: 4, max: 4 }));
+  }
+
+  const { digits } = decodeDtmf(entered);
+  if (digits.length === 4 && (await verifyPin(digits, user.pin_hash))) {
+    await sb(`auth_users?id=eq.${user.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ pin_failures: 0, pin_locked_until: null }),
+    });
+    markAuthed(c, phone);
+    return ivr("go_to_folder=/1");
+  }
+
+  const failures = (user.pin_failures ?? 0) + 1;
+  const lock = failures >= MAX_PIN_FAILURES ? new Date(Date.now() + LOCK_MINUTES * 60_000).toISOString() : null;
+  await sb(`auth_users?id=eq.${user.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ pin_failures: lock ? 0 : failures, pin_locked_until: lock }),
+  });
+  if (lock) return ivr(say("יותר מדי ניסיונות, נסו שוב מאוחר יותר"), hangup());
+  return ivr(say("הקוד שגוי"), readCmd("אנא הקש קוד סודי", "val_pin", { min: 4, max: 4 }));
+});
+
+// ---------- Extension 999: set up a new PIN ----------
+yemotRoute("/yemot/ext999", async (c) => {
+  const phone = callerPhone(c);
+  if (!phone) return ivr(say("מספר המתקשר אינו זמין, להתראות"), hangup());
+  const user = await loadUser(phone);
+  if (user.pin_hash) return ivr("go_to_folder=/998");
+
+  const entered = latest(c, "val_pin");
+  if (entered === undefined) {
+    return ivr(readCmd("שלום אנא בחר קוד סודי בן 4 ספרות", "val_pin", { min: 4, max: 4 }));
+  }
+
+  const { digits } = decodeDtmf(entered);
+  if (digits.length !== 4) {
+    return ivr(say("קוד לא תקין"), readCmd("אנא בחר קוד סודי בן 4 ספרות", "val_pin", { min: 4, max: 4 }));
+  }
+
+  const salt = crypto.randomUUID().slice(0, 8);
+  await sb(`auth_users?id=eq.${user.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ pin_hash: await hashPin(digits, salt), pin_failures: 0, pin_locked_until: null }),
+  });
+  markAuthed(c, phone);
+  return ivr(say("הקוד נשמר בהצלחה"), "go_to_folder=/1");
+});
+
+// ---------- Extension 1: main menu (authenticated calls only) ----------
+const MENU_PROMPT = "לקבלת קוד הקש 11, להזנת חשבון חדש הקש 12";
+
+yemotRoute("/yemot/ext1", async (c) => {
+  if (!isAuthed(c)) return ivr("go_to_folder=/99");
+
+  const raw = latest(c, "val_menu");
+  if (raw === undefined) return ivr(readCmd(MENU_PROMPT, "val_menu", { min: 2, max: 2 }));
+
+  const choice = decodeDtmf(raw).digits;
+  if (choice === "11") return ivr("go_to_folder=/1/1");
+  if (choice === "12") return ivr("go_to_folder=/1/2");
+  return ivr(say("בחירה לא חוקית"), readCmd(MENU_PROMPT, "val_menu", { min: 2, max: 2 }));
+});
+
+// ---------- Folder 1/1: code playback (menu 11) ----------
+// Post-code menu: 1 repeat, 2 another slot, 9 back to main menu (/1).
+// Params: val_slot (first slot), val_slot2 (another slot), val_after (post-code menu answers).
+async function speakCode(user: Row, slot: number): Promise<Response> {
+  const accounts: Row[] = await sb(`totp_accounts?user_id=eq.${user.id}&slot_number=eq.${slot}&select=*`);
+  if (!accounts[0]) return ivr(say("אין חשבון במשבצת זו"), hangup());
+  const code = await totp(accounts[0].totp_secret, accounts[0].digits, accounts[0].period);
+  return ivr(
+    say("הקוד שלך הוא"),
+    `id_list_message=d-${code}`,
+    readCmd("לשמיעה חוזרת הקש 1, למשבצת אחרת הקש 2, לחזרה לתפריט הראשי הקש 9", "val_after", { min: 1, max: 1 }),
+  );
+}
+
+yemotRoute("/yemot/ext11", async (c) => {
+  if (!isAuthed(c)) return ivr("go_to_folder=/99");
+  const phone = callerPhone(c);
+  if (!phone) return ivr(say("מספר המתקשר אינו זמין, להתראות"), hangup());
+  const user = await loadUser(phone);
+
+  const slotAll = all(c, "val_slot");
+  const slot2All = all(c, "val_slot2");
+  const afterAll = all(c, "val_after");
+  const entered = slotAll.length + slot2All.length;
+  const answers = afterAll.length;
+  const twos = afterAll.filter((v) => decodeDtmf(v).digits === "2").length;
+
+  // First request: ask which slot.
+  if (entered === 0) {
+    return ivr(readCmd("הקש מספר משבצת", "val_slot", { min: 1, max: 2 }));
+  }
+  // Caller pressed 2 on the post-code menu: ask for another slot.
+  if (twos > slot2All.length) {
+    return ivr(readCmd("הקש מספר משבצת", "val_slot2", { min: 1, max: 2 }));
+  }
+  const currentSlot = Number(decodeDtmf(slot2All.length > 0 ? latest(c, "val_slot2") : latest(c, "val_slot")).digits);
+
+  // A new slot was entered and its code has not been spoken yet.
+  if (entered > answers) return speakCode(user, currentSlot);
+
+  // Answer to the post-code menu.
+  const after = decodeDtmf(latest(c, "val_after")).digits;
+  if (after === "1") return speakCode(user, currentSlot);
+  if (after === "9") return ivr("go_to_folder=/1");
+  return ivr(say("להתראות"), hangup());
+});
+
+// ---------- Folder 1/2: seed input (menu 12) ----------
+yemotRoute("/yemot/ext12", async (c) => {
+  if (!isAuthed(c)) return ivr("go_to_folder=/99");
+  return ivr(say("הזנת חשבון חדש אינה זמינה כרגע"), hangup());
 });
 
 app.get("/health", (c) => c.json({ ok: true }));
