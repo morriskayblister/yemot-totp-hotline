@@ -129,18 +129,25 @@ function readCmd(prompt: string, valName: string, opts: { min: number; max: numb
 
 // Yemot accumulates every earlier answer in later requests, so a param can be an array.
 // The most recent answer is the last element.
-function latest(c: Context, name: string): string | undefined {
-  const all = c.req.queries(name);
-  return all && all.length ? all[all.length - 1] : undefined;
+function all(c: Context, name: string): string[] {
+  return c.req.queries(name) ?? [];
 }
 
-function count(c: Context, name: string): number {
-  return c.req.queries(name)?.length ?? 0;
+function latest(c: Context, name: string): string | undefined {
+  const list = all(c, name);
+  return list.length ? list[list.length - 1] : undefined;
 }
 
 // ---------- IVR flow ----------
 // Query params from Yemot: ApiPhone (caller). Read results come back as params named after the read val_name:
-// pin_set (new PIN), pin (login PIN), menu (menu choice), slot (account slot), after (choice after the code).
+// pin_set (new PIN), pin (login PIN), menu (menu choice), slot (account slot), slot2 (account slot after choosing another slot),
+// after (choice after the code: 1 repeat, 2 another slot, 9 hang up).
+//
+// Counting rule for the code flow (no ordering info across param names, so counts are used):
+//   s = slot entries (slot + slot2), a = after answers, two = after answers equal to "2".
+//   - two > slot2 count: caller chose another slot, read slot2 now.
+//   - s > a: a new slot was entered and its code is not spoken yet, speak it and offer the after menu.
+//   - a > 0: answer to the after menu: 1 replays the current code, anything else hangs up.
 async function handleYemot(c: Context) {
   // Yemot sends hangup=yes when the caller disconnects. Nothing to say; return an empty body.
   if (c.req.query("hangup") === "yes") {
@@ -183,29 +190,46 @@ async function handleYemot(c: Context) {
     return ivr(say("יותר מדי ניסיונות, נסו שוב מאוחר יותר"), "hangup=yes");
   }
 
-  // Account slot chosen: read the TOTP code, then offer repeat / another slot / hang up.
-  // Checked first, because later requests carry earlier answers.
-  // slot answers and after answers are counted: a new slot answer that has no matching "after" answer yet
-  // means the code still needs to be spoken.
-  const slotIn = latest(c, "slot");
-  if (slotIn !== undefined) {
-    const afterIn = latest(c, "after");
-    const pending = count(c, "slot") > count(c, "after");
-    if (!pending && afterIn === "2") {
-      return ivr(readCmd("הקש מספר משבצת", "slot", { min: 1, max: 2 }));
+  // Code flow: slot / slot2 / after params.
+  const slotAll = all(c, "slot");
+  const slot2All = all(c, "slot2");
+  const afterAll = all(c, "after");
+  const s = slotAll.length + slot2All.length;
+  const a = afterAll.length;
+  const two = afterAll.filter((v) => decodeDtmf(v).digits === "2").length;
+
+  if (s > 0 || a > 0) {
+    // Caller pressed 2 on the after menu: read another slot number.
+    if (two > slot2All.length) {
+      return ivr(readCmd("הקש מספר משבצת", "slot2", { min: 1, max: 2 }));
     }
-    if (!pending && afterIn !== undefined && afterIn !== "1") {
-      return ivr(say("להתראות"), "hangup=yes");
+    const currentSlotRaw = slot2All.length > 0 ? latest(c, "slot2") : latest(c, "slot");
+    // A new slot was entered and its code is not spoken yet.
+    if (s > a) {
+      const slot = Number(decodeDtmf(currentSlotRaw).digits);
+      const accounts = await sb(`totp_accounts?user_id=eq.${user.id}&slot_number=eq.${slot}&select=*`);
+      if (!accounts[0]) return ivr(say("אין חשבון במשבצת זו"), "hangup=yes");
+      const code = await totp(accounts[0].totp_secret, accounts[0].digits, accounts[0].period);
+      return ivr(
+        say("הקוד שלך הוא"),
+        `id_list_message=d-${code}`,
+        readCmd("לשמיעה חוזרת הקש 1, למשבצת אחרת הקש 2, לניתוק הקש 9", "after", { min: 1, max: 1 }),
+      );
     }
-    const slot = Number(decodeDtmf(slotIn).digits);
-    const accounts = await sb(`totp_accounts?user_id=eq.${user.id}&slot_number=eq.${slot}&select=*`);
-    if (!accounts[0]) return ivr(say("אין חשבון במשבצת זו"), readCmd("הקש מספר משבצת", "slot", { min: 1, max: 2 }));
-    const code = await totp(accounts[0].totp_secret, accounts[0].digits, accounts[0].period);
-    return ivr(
-      say("הקוד שלך הוא"),
-      `id_list_message=d-${code}`,
-      readCmd("לשמיעה חוזרת הקש 1, למשבצת אחרת הקש 2, לניתוק הקש 9", "after", { min: 1, max: 1 }),
-    );
+    // Answer to the after menu.
+    const after = decodeDtmf(latest(c, "after")).digits;
+    if (after === "1") {
+      const slot = Number(decodeDtmf(currentSlotRaw).digits);
+      const accounts = await sb(`totp_accounts?user_id=eq.${user.id}&slot_number=eq.${slot}&select=*`);
+      if (!accounts[0]) return ivr(say("אין חשבון במשבצת זו"), "hangup=yes");
+      const code = await totp(accounts[0].totp_secret, accounts[0].digits, accounts[0].period);
+      return ivr(
+        say("הקוד שלך הוא"),
+        `id_list_message=d-${code}`,
+        readCmd("לשמיעה חוזרת הקש 1, למשבצת אחרת הקש 2, לניתוק הקש 9", "after", { min: 1, max: 1 }),
+      );
+    }
+    return ivr(say("להתראות"), "hangup=yes");
   }
 
   // Menu choice
