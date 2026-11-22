@@ -266,8 +266,8 @@ yemotRoute("/yemot/ext999", async (c) => {
   return ivr(say("הקוד נשמר בהצלחה"), "go_to_folder=/1");
 });
 
-// ---------- Extension 1: main menu (authenticated calls only) ----------
-const MENU_PROMPT = "לקבלת קוד הקש 1 להזנת חשבון חדש הקש 2";
+// ---------- Extension 1: main menu fallback (native Yemot menu /1 normally handles this) ----------
+const MENU_PROMPT = "לקבלת קוד הקש 1, להזנת חשבון חדש הקש 2, למחיקת חשבון הקש 3";
 
 yemotRoute("/yemot/ext1", async (c) => {
   if (!isAuthed(c)) return ivr("go_to_folder=/99");
@@ -278,6 +278,7 @@ yemotRoute("/yemot/ext1", async (c) => {
   const choice = decodeDtmf(raw).digits;
   if (choice === "1") return ivr("go_to_folder=/1/1");
   if (choice === "2") return ivr("go_to_folder=/1/2");
+  if (choice === "3") return ivr("go_to_folder=/1/3");
   return ivr(say("בחירה לא חוקית"), readCmd(MENU_PROMPT, "val_menu", { min: 1, max: 1 }));
 });
 
@@ -328,11 +329,10 @@ yemotRoute("/yemot/ext11", async (c) => {
   return ivr(say("להתראות"), hangup());
 });
 
-// ---------- Folder 1/2: TOTP seed entry by keypad ----------
-// Keypad encoding (2 digits per character, * = backspace, # = end):
-//   00-09 = digits 0-9, 21-23 = A-C, 31-33 = D-F, 41-43 = G-I, 51-53 = J-L,
-//   61-63 = M-O, 71-74 = P-S, 81-83 = T-V, 91-94 = W-Z.
-// Only A-Z and 2-7 are valid base32, so 0, 1, 8 and 9 are rejected at validation.
+// ---------- Keypad text decoding (shared by seed and account name) ----------
+// Pairs: 00-09 = digits 0-9, 21-23 = A-C, 31-33 = D-F, 41-43 = G-I, 51-53 = J-L,
+//        61-63 = M-O, 71-74 = P-S, 81-83 = T-V, 91-94 = W-Z.
+// "*" = space (a single "**" also gives one space). "#" at the end terminates input.
 const DTMF_LETTERS: Record<string, string> = {
   "21": "A", "22": "B", "23": "C",
   "31": "D", "32": "E", "33": "F",
@@ -343,17 +343,14 @@ const DTMF_LETTERS: Record<string, string> = {
   "81": "T", "82": "U", "83": "V",
   "91": "W", "92": "X", "93": "Y", "94": "Z",
 };
-const MIN_SEED_LENGTH = 16;
-const SEED_PROMPT = "אנא הקש את מפתח האימות ולאחריו סולמית";
-const SEED_READ = { min: 2, max: 100, timeout: 30 };
 
-// Converts the raw keypad string into a validated base32 seed, or null if it is not usable.
-async function decodeSeedDtmf(raw: string): Promise<string | null> {
+// Returns the decoded text (uppercase letters, digits, single spaces, trimmed), or null if any pair is invalid.
+function decodeDtmfText(raw: string): string | null {
   const s = raw.replace(/\s/g, "").replace(/#+$/, "");
   let out = "";
   for (let i = 0; i < s.length; ) {
     if (s[i] === "*") {
-      out = out.slice(0, -1);
+      out += " ";
       i += 1;
       continue;
     }
@@ -368,7 +365,22 @@ async function decodeSeedDtmf(raw: string): Promise<string | null> {
     }
     i += 2;
   }
-  const seed = out.toUpperCase();
+  return out.replace(/ +/g, " ").trim();
+}
+
+// ---------- Folder 1/2: add account (seed, then name) ----------
+const MIN_SEED_LENGTH = 16;
+const SEED_PROMPT = "אנא הקש את מפתח האימות ולאחריו סולמית";
+const SEED_READ = { min: 2, max: 100, timeout: 30 };
+const NAME_PROMPT = "אנא הקש את שם החשבון ולאחריו סולמית";
+const NAME_READ = { min: 1, max: 80, timeout: 30 };
+const MAX_NAME_LENGTH = 40;
+
+// Converts the raw seed keypad input into a validated base32 seed (spaces removed), or null.
+async function decodeSeed(raw: string): Promise<string | null> {
+  const text = decodeDtmfText(raw);
+  if (text === null) return null;
+  const seed = text.replace(/ /g, "").toUpperCase();
   if (seed.length < MIN_SEED_LENGTH || !/^[A-Z2-7]+$/.test(seed)) return null;
   try {
     await totp(seed);
@@ -378,15 +390,23 @@ async function decodeSeedDtmf(raw: string): Promise<string | null> {
   return seed;
 }
 
+// Converts the raw name keypad input into a display name, or null if empty, invalid, or too long.
+function decodeAccountName(raw: string): string | null {
+  const text = decodeDtmfText(raw);
+  if (text === null || text.length < 1 || text.length > MAX_NAME_LENGTH) return null;
+  return text;
+}
+
 yemotRoute("/yemot/ext12", async (c) => {
   if (!isAuthed(c)) return ivr("go_to_folder=/99");
   const phone = callerPhone(c);
   if (!phone) return ivr(say("מספר המתקשר אינו זמין, להתראות"), hangup());
 
-  const raw = latest(c, "val_seed_raw");
-  if (raw === undefined) return ivr(readCmd(SEED_PROMPT, "val_seed_raw", SEED_READ));
+  // Step 1: seed.
+  const rawSeed = latest(c, "val_seed_raw");
+  if (rawSeed === undefined) return ivr(readCmd(SEED_PROMPT, "val_seed_raw", SEED_READ));
 
-  const seed = await decodeSeedDtmf(raw);
+  const seed = await decodeSeed(rawSeed);
   if (!seed) {
     return ivr(say("המפתח שהוקש אינו תקין"), readCmd(SEED_PROMPT, "val_seed_raw", SEED_READ));
   }
@@ -407,11 +427,54 @@ yemotRoute("/yemot/ext12", async (c) => {
   }
   if (!slot) return ivr(say("אין משבצת פנויה"), "go_to_folder=/1");
 
+  // Step 2: account name.
+  const rawName = latest(c, "val_name_raw");
+  if (rawName === undefined) return ivr(readCmd(NAME_PROMPT, "val_name_raw", NAME_READ));
+
+  const name = decodeAccountName(rawName);
+  if (!name) {
+    return ivr(say("שם החשבון אינו תקין"), readCmd(NAME_PROMPT, "val_name_raw", NAME_READ));
+  }
+
   await sb("totp_accounts", {
     method: "POST",
-    body: JSON.stringify({ user_id: user.id, slot_number: slot, totp_secret: seed, digits: 6, period: 30, algorithm: "SHA1" }),
+    body: JSON.stringify({
+      user_id: user.id,
+      slot_number: slot,
+      totp_secret: seed,
+      account_label: name,
+      digits: 6,
+      period: 30,
+      algorithm: "SHA1",
+    }),
   });
   return ivr(say("המפתח נשמר בהצלחה במשבצת"), `id_list_message=d-${slot}`, "go_to_folder=/1");
+});
+
+// ---------- Folder 1/3: delete account by slot ----------
+const DELETE_PROMPT = "הקש את מספר המשבצת למחיקה";
+const DELETE_READ = { min: 1, max: 1, timeout: 15 };
+
+yemotRoute("/yemot/ext13", async (c) => {
+  if (!isAuthed(c)) return ivr("go_to_folder=/99");
+  const phone = callerPhone(c);
+  if (!phone) return ivr(say("מספר המתקשר אינו זמין, להתראות"), hangup());
+
+  const raw = latest(c, "val_del_slot");
+  if (raw === undefined) return ivr(readCmd(DELETE_PROMPT, "val_del_slot", DELETE_READ));
+
+  const digits = decodeDtmf(raw).digits;
+  const slot = Number(digits);
+  if (!/^[1-9]$/.test(digits) || slot < 1 || slot > 9) {
+    return ivr(say("מספר משבצת לא תקין"), readCmd(DELETE_PROMPT, "val_del_slot", DELETE_READ));
+  }
+
+  const user = await loadUser(phone);
+  const owned: Row[] = await sb(`totp_accounts?user_id=eq.${user.id}&slot_number=eq.${slot}&select=id`);
+  if (!owned[0]) return ivr(say("אין חשבון במשבצת זו"), "go_to_folder=/1");
+
+  await sb(`totp_accounts?id=eq.${owned[0].id}&user_id=eq.${user.id}`, { method: "DELETE" });
+  return ivr(say("החשבון נמחק בהצלחה"), "go_to_folder=/1");
 });
 
 app.get("/health", (c) => c.json({ ok: true }));
