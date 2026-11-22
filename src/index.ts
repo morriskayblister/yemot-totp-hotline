@@ -393,10 +393,13 @@ function decodeDtmfText(raw: string): string | null {
 
 // ---------- Folder 1/2: add account (seed, then name) ----------
 const MIN_SEED_LENGTH = 16;
+const MAX_INPUT_ATTEMPTS = 3;
 const SEED_PROMPT = "אנא הקש את מפתח האימות ולאחריו סולמית";
 const SEED_READ = { min: 2, max: 100, timeout: 30 };
+const SEED_ERROR = "המפתח שהוקש אינו תקין. מפתח אימות מורכב מאותיות באנגלית ומספרים שתיים עד שבע בלבד, ללא אפס אחת שמונה או תשע";
 const NAME_PROMPT = "אנא הקש את שם החשבון ולאחריו סולמית";
 const NAME_READ = { min: 1, max: 80, timeout: 30 };
+const NAME_ERROR = "שם החשבון אינו תקין";
 const MAX_NAME_LENGTH = 40;
 
 // Spoken keypad instructions, played before each text prompt. Written without commas, equals signs or ampersands.
@@ -431,15 +434,18 @@ yemotRoute("/yemot/ext12", async (c) => {
   if (!phone) return ivr(say("מספר המתקשר אינו זמין, להתראות"), hangup());
 
   // Step 1: seed. Instructions play before the prompt, and again after an invalid entry.
-  const rawSeed = latest(c, "val_seed_raw");
-  if (rawSeed === undefined) {
+  const seedAll = all(c, "val_seed_raw");
+  if (seedAll.length === 0) {
     return ivr(...SEED_HELP_LINES, readCmd(SEED_PROMPT, "val_seed_raw", SEED_READ));
   }
 
-  const seed = await decodeSeed(rawSeed);
+  const seed = await decodeSeed(latest(c, "val_seed_raw") ?? "");
   if (!seed) {
+    if (seedAll.length >= MAX_INPUT_ATTEMPTS) {
+      return ivr(say("לא הצלחנו לזהות מפתח תקין, להתראות"), hangup());
+    }
     return ivr(
-      say("המפתח שהוקש אינו תקין"),
+      say(SEED_ERROR),
       ...SEED_HELP_LINES,
       readCmd(SEED_PROMPT, "val_seed_raw", SEED_READ),
     );
@@ -462,15 +468,18 @@ yemotRoute("/yemot/ext12", async (c) => {
   if (!slot) return ivr(say("אין משבצת פנויה"), "go_to_folder=/1");
 
   // Step 2: account name. Instructions play before the prompt, and again after an invalid entry.
-  const rawName = latest(c, "val_name_raw");
-  if (rawName === undefined) {
+  const nameAll = all(c, "val_name_raw");
+  if (nameAll.length === 0) {
     return ivr(...SEED_HELP_LINES, readCmd(NAME_PROMPT, "val_name_raw", NAME_READ));
   }
 
-  const name = decodeAccountName(rawName);
+  const name = decodeAccountName(latest(c, "val_name_raw") ?? "");
   if (!name) {
+    if (nameAll.length >= MAX_INPUT_ATTEMPTS) {
+      return ivr(say("לא הצלחנו לזהות שם תקין, להתראות"), hangup());
+    }
     return ivr(
-      say("שם החשבון אינו תקין"),
+      say(NAME_ERROR),
       ...SEED_HELP_LINES,
       readCmd(NAME_PROMPT, "val_name_raw", NAME_READ),
     );
