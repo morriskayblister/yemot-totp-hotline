@@ -376,6 +376,11 @@ const NAME_PROMPT = "אנא הקש את שם החשבון ולאחריו סול�
 const NAME_READ = { min: 1, max: 80, timeout: 30 };
 const MAX_NAME_LENGTH = 40;
 
+// Spoken keypad instructions, played before each text prompt. Written without commas, equals signs or ampersands.
+const KEYPAD_HELP =
+  "הוראות הקלדה. כל אות או ספרה מוקלדת בשתי ספרות. לספרה הקישו אפס ואחריה הספרה, לדוגמה אפס אחת לאחת. לאות הקישו את מספר המקש ואחריו מיקום האות במקש, לדוגמה עשרים ואחת לאות א, עשרים ושתיים לאות ב, תשעים וארבע לאות ז. לרווח הקישו כוכבית. בסיום הקישו סולמית.";
+const SEED_HELP_LINES = [say(KEYPAD_HELP)];
+
 // Converts the raw seed keypad input into a validated base32 seed (spaces removed), or null.
 async function decodeSeed(raw: string): Promise<string | null> {
   const text = decodeDtmfText(raw);
@@ -402,13 +407,19 @@ yemotRoute("/yemot/ext12", async (c) => {
   const phone = callerPhone(c);
   if (!phone) return ivr(say("מספר המתקשר אינו זמין, להתראות"), hangup());
 
-  // Step 1: seed.
+  // Step 1: seed. Instructions play before the prompt, and again after an invalid entry.
   const rawSeed = latest(c, "val_seed_raw");
-  if (rawSeed === undefined) return ivr(readCmd(SEED_PROMPT, "val_seed_raw", SEED_READ));
+  if (rawSeed === undefined) {
+    return ivr(...SEED_HELP_LINES, readCmd(SEED_PROMPT, "val_seed_raw", SEED_READ));
+  }
 
   const seed = await decodeSeed(rawSeed);
   if (!seed) {
-    return ivr(say("המפתח שהוקש אינו תקין"), readCmd(SEED_PROMPT, "val_seed_raw", SEED_READ));
+    return ivr(
+      say("המפתח שהוקש אינו תקין"),
+      ...SEED_HELP_LINES,
+      readCmd(SEED_PROMPT, "val_seed_raw", SEED_READ),
+    );
   }
 
   const user = await loadUser(phone);
@@ -427,13 +438,19 @@ yemotRoute("/yemot/ext12", async (c) => {
   }
   if (!slot) return ivr(say("אין משבצת פנויה"), "go_to_folder=/1");
 
-  // Step 2: account name.
+  // Step 2: account name. Instructions play before the prompt, and again after an invalid entry.
   const rawName = latest(c, "val_name_raw");
-  if (rawName === undefined) return ivr(readCmd(NAME_PROMPT, "val_name_raw", NAME_READ));
+  if (rawName === undefined) {
+    return ivr(...SEED_HELP_LINES, readCmd(NAME_PROMPT, "val_name_raw", NAME_READ));
+  }
 
   const name = decodeAccountName(rawName);
   if (!name) {
-    return ivr(say("שם החשבון אינו תקין"), readCmd(NAME_PROMPT, "val_name_raw", NAME_READ));
+    return ivr(
+      say("שם החשבון אינו תקין"),
+      ...SEED_HELP_LINES,
+      readCmd(NAME_PROMPT, "val_name_raw", NAME_READ),
+    );
   }
 
   await sb("totp_accounts", {
