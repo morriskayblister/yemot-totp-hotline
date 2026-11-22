@@ -282,6 +282,24 @@ yemotRoute("/yemot/ext1", async (c) => {
   return ivr(say("בחירה לא חוקית"), readCmd(MENU_PROMPT, "val_menu", { min: 1, max: 1 }));
 });
 
+// ---------- Caller's accounts, listed by slot ----------
+// Account names are stored as account_label (letters, digits and single spaces only, from the keypad).
+async function accountsFor(user: Row): Promise<Row[]> {
+  return sb(`totp_accounts?user_id=eq.${user.id}&select=id,slot_number,account_label&order=slot_number.asc`);
+}
+
+function accountName(a: Row): string {
+  return a.account_label || `משבצת ${a.slot_number}`;
+}
+
+// Builds the spoken choice list, e.g. "עבור NAME1 הקש 1 עבור NAME2 הקש 2". "template" receives the name and slot.
+function accountChoicePrompt(accounts: Row[], template: (name: string, slot: number) => string): string {
+  return accounts.map((a) => template(accountName(a), Number(a.slot_number))).join(" ");
+}
+
+const CODE_TEMPLATE = (name: string, slot: number) => `עבור ${name} הקש ${slot}`;
+const DELETE_TEMPLATE = (name: string, slot: number) => `למחיקת ${name} הקש ${slot}`;
+
 // ---------- Folder 1/1: code playback (menu 1) ----------
 // Post-code menu: 1 repeat, 2 another slot, 9 back to main menu (/1).
 // Params: val_slot (first slot), val_slot2 (another slot), val_after (post-code menu answers).
@@ -302,6 +320,11 @@ yemotRoute("/yemot/ext11", async (c) => {
   if (!phone) return ivr(say("מספר המתקשר אינו זמין, להתראות"), hangup());
   const user = await loadUser(phone);
 
+  const accounts = await accountsFor(user);
+  if (accounts.length === 0) return ivr(say("אין חשבונות שמורים במערכת"), "go_to_folder=/1");
+  const chooseMenu = (valName: string) =>
+    readCmd(accountChoicePrompt(accounts, CODE_TEMPLATE), valName, { min: 1, max: 1 });
+
   const slotAll = all(c, "val_slot");
   const slot2All = all(c, "val_slot2");
   const afterAll = all(c, "val_after");
@@ -309,17 +332,17 @@ yemotRoute("/yemot/ext11", async (c) => {
   const answers = afterAll.length;
   const twos = afterAll.filter((v) => decodeDtmf(v).digits === "2").length;
 
-  // First request: ask which slot.
+  // First request: list the accounts by name and ask which one.
   if (entered === 0) {
-    return ivr(readCmd("הקש מספר משבצת", "val_slot", { min: 1, max: 2 }));
+    return ivr(chooseMenu("val_slot"));
   }
-  // Caller pressed 2 on the post-code menu: ask for another slot.
+  // Caller pressed 2 on the post-code menu: list the accounts again.
   if (twos > slot2All.length) {
-    return ivr(readCmd("הקש מספר משבצת", "val_slot2", { min: 1, max: 2 }));
+    return ivr(chooseMenu("val_slot2"));
   }
   const currentSlot = Number(decodeDtmf(slot2All.length > 0 ? latest(c, "val_slot2") : latest(c, "val_slot")).digits);
 
-  // A new slot was entered and its code has not been spoken yet.
+  // A new slot was chosen and its code has not been spoken yet.
   if (entered > answers) return speakCode(user, currentSlot);
 
   // Answer to the post-code menu.
@@ -468,29 +491,31 @@ yemotRoute("/yemot/ext12", async (c) => {
   return ivr(say("המפתח נשמר בהצלחה במשבצת"), `id_list_message=d-${slot}`, "go_to_folder=/1");
 });
 
-// ---------- Folder 1/3: delete account by slot ----------
-const DELETE_PROMPT = "הקש את מספר המשבצת למחיקה";
-const DELETE_READ = { min: 1, max: 1, timeout: 15 };
-
+// ---------- Folder 1/3: delete account, chosen by name ----------
 yemotRoute("/yemot/ext13", async (c) => {
   if (!isAuthed(c)) return ivr("go_to_folder=/99");
   const phone = callerPhone(c);
   if (!phone) return ivr(say("מספר המתקשר אינו זמין, להתראות"), hangup());
+  const user = await loadUser(phone);
+
+  const accounts = await accountsFor(user);
+  if (accounts.length === 0) return ivr(say("אין חשבונות שמורים במערכת"), "go_to_folder=/1");
 
   const raw = latest(c, "val_del_slot");
-  if (raw === undefined) return ivr(readCmd(DELETE_PROMPT, "val_del_slot", DELETE_READ));
-
-  const digits = decodeDtmf(raw).digits;
-  const slot = Number(digits);
-  if (!/^[1-9]$/.test(digits) || slot < 1 || slot > 9) {
-    return ivr(say("מספר משבצת לא תקין"), readCmd(DELETE_PROMPT, "val_del_slot", DELETE_READ));
+  if (raw === undefined) {
+    return ivr(readCmd(accountChoicePrompt(accounts, DELETE_TEMPLATE), "val_del_slot", { min: 1, max: 1, timeout: 15 }));
   }
 
-  const user = await loadUser(phone);
-  const owned: Row[] = await sb(`totp_accounts?user_id=eq.${user.id}&slot_number=eq.${slot}&select=id`);
-  if (!owned[0]) return ivr(say("אין חשבון במשבצת זו"), "go_to_folder=/1");
+  const digits = decodeDtmf(raw).digits;
+  const target = accounts.find((a) => String(a.slot_number) === digits);
+  if (!target) {
+    return ivr(
+      say("מספר משבצת לא תקין"),
+      readCmd(accountChoicePrompt(accounts, DELETE_TEMPLATE), "val_del_slot", { min: 1, max: 1, timeout: 15 }),
+    );
+  }
 
-  await sb(`totp_accounts?id=eq.${owned[0].id}&user_id=eq.${user.id}`, { method: "DELETE" });
+  await sb(`totp_accounts?id=eq.${target.id}&user_id=eq.${user.id}`, { method: "DELETE" });
   return ivr(say("החשבון נמחק בהצלחה"), "go_to_folder=/1");
 });
 
