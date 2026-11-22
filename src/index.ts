@@ -186,7 +186,7 @@ function yemotRoute(path: string, handler: (c: Context) => Promise<Response>): v
       return await handler(c);
     } catch (err) {
       console.error(JSON.stringify({ ev: "error", path, message: String(err) }));
-      return ivr(say("שגיאת מערכת, נסו שוב מאוחר יותר"), hangup());
+      return ivr(say("שגיאת מערכת נסו שוב מאוחר יותר"), hangup());
     }
   });
 }
@@ -199,7 +199,7 @@ yemotRoute("/yemot", async (c) => {
 // ---------- Extension 99: router by PIN state ----------
 yemotRoute("/yemot/ext99", async (c) => {
   const phone = callerPhone(c);
-  if (!phone) return ivr(say("מספר המתקשר אינו זמין, להתראות"), hangup());
+  if (!phone) return ivr(say("מספר המתקשר אינו זמין להתראות"), hangup());
   const user = await loadUser(phone);
   return ivr(user.pin_hash ? "go_to_folder=/998" : "go_to_folder=/999");
 });
@@ -207,12 +207,12 @@ yemotRoute("/yemot/ext99", async (c) => {
 // ---------- Extension 998: verify existing PIN ----------
 yemotRoute("/yemot/ext998", async (c) => {
   const phone = callerPhone(c);
-  if (!phone) return ivr(say("מספר המתקשר אינו זמין, להתראות"), hangup());
+  if (!phone) return ivr(say("מספר המתקשר אינו זמין להתראות"), hangup());
   const user = await loadUser(phone);
   if (!user.pin_hash) return ivr("go_to_folder=/999");
 
   if (user.pin_locked_until && new Date(user.pin_locked_until) > new Date()) {
-    return ivr(say("יותר מדי ניסיונות, נסו שוב מאוחר יותר"), hangup());
+    return ivr(say("יותר מדי ניסיונות נסו שוב מאוחר יותר"), hangup());
   }
 
   const entered = latest(c, "val_pin");
@@ -236,14 +236,14 @@ yemotRoute("/yemot/ext998", async (c) => {
     method: "PATCH",
     body: JSON.stringify({ pin_failures: lock ? 0 : failures, pin_locked_until: lock }),
   });
-  if (lock) return ivr(say("יותר מדי ניסיונות, נסו שוב מאוחר יותר"), hangup());
+  if (lock) return ivr(say("יותר מדי ניסיונות נסו שוב מאוחר יותר"), hangup());
   return ivr(say("הקוד שגוי"), readCmd("אנא הקש קוד סודי", "val_pin", { min: 4, max: 4 }));
 });
 
 // ---------- Extension 999: set up a new PIN ----------
 yemotRoute("/yemot/ext999", async (c) => {
   const phone = callerPhone(c);
-  if (!phone) return ivr(say("מספר המתקשר אינו זמין, להתראות"), hangup());
+  if (!phone) return ivr(say("מספר המתקשר אינו זמין להתראות"), hangup());
   const user = await loadUser(phone);
   if (user.pin_hash) return ivr("go_to_folder=/998");
 
@@ -267,7 +267,7 @@ yemotRoute("/yemot/ext999", async (c) => {
 });
 
 // ---------- Extension 1: main menu fallback (native Yemot menu /1 normally handles this) ----------
-const MENU_PROMPT = "לקבלת קוד הקש 1, להזנת חשבון חדש הקש 2, למחיקת חשבון הקש 3";
+const MENU_PROMPT = "לקבלת קוד הקש 1 להזנת חשבון חדש הקש 2 למחיקת חשבון הקש 3";
 
 yemotRoute("/yemot/ext1", async (c) => {
   if (!isAuthed(c)) return ivr("go_to_folder=/99");
@@ -310,14 +310,14 @@ async function speakCode(user: Row, slot: number): Promise<Response> {
   return ivr(
     say("הקוד שלך הוא"),
     `id_list_message=d-${code}`,
-    readCmd("לשמיעה חוזרת הקש 1, למשבצת אחרת הקש 2, לחזרה לתפריט הראשי הקש 9", "val_after", { min: 1, max: 1 }),
+    readCmd("לשמיעה חוזרת הקש 1 למשבצת אחרת הקש 2 לחזרה לתפריט הראשי הקש 9", "val_after", { min: 1, max: 1 }),
   );
 }
 
 yemotRoute("/yemot/ext11", async (c) => {
   if (!isAuthed(c)) return ivr("go_to_folder=/99");
   const phone = callerPhone(c);
-  if (!phone) return ivr(say("מספר המתקשר אינו זמין, להתראות"), hangup());
+  if (!phone) return ivr(say("מספר המתקשר אינו זמין להתראות"), hangup());
   const user = await loadUser(phone);
 
   const accounts = await accountsFor(user);
@@ -397,24 +397,24 @@ const MAX_INPUT_ATTEMPTS = 3;
 // Read limits: a base32 seed of up to 32 characters is 64 keypresses; an account name of up to 40 characters is 80.
 const SEED_PROMPT = "אנא הקש את מפתח האימות ולאחריו סולמית";
 const SEED_READ = { min: 2, max: 64, timeout: 30 };
-const SEED_ERROR = "המפתח שהוקש אינו תקין. מפתח אימות מורכב מאותיות באנגלית ומספרים שתיים עד שבע בלבד. אין להקיש אפס אחת שמונה או תשע";
+const SEED_ERROR = "המפתח שהוקש אינו תקין מפתח אימות מורכב מאותיות באנגלית ומספרים שתיים עד שבע בלבד אין להקיש אפס אחת שמונה או תשע";
 const NAME_PROMPT = "אנא הקש את שם החשבון ולאחריו סולמית";
 const NAME_READ = { min: 1, max: 80, timeout: 30 };
 const NAME_ERROR = "שם החשבון אינו תקין";
 const MAX_NAME_LENGTH = 40;
 
-// Spoken keypad instructions, played before each text prompt. Written without commas, equals signs or ampersands.
-// Split into short sentences so the TTS plays each one cleanly.
+// Spoken keypad instructions. Played once, before the first seed prompt only.
+// No periods, commas, quotes or hyphens: each part is a separate spoken item.
 const KEYPAD_HELP_PARTS = [
   "הוראות הקלדה",
   "כל אות או ספרה מוקלדת בשתי ספרות",
-  "לספרה הקישו אפס ואחריה הספרה. לדוגמה אפס אחת לאחת",
+  "לספרה הקישו אפס ואחריה הספרה לדוגמה אפס אחת לאחת",
   "לאות הקישו את מספר המקש ואחריו מיקום האות במקש",
-  "לדוגמה עשרים ואחת לאות א. עשרים ושתיים לאות ב. תשעים וארבע לאות ז",
+  "לדוגמה עשרים ואחת לאות א עשרים ושתיים לאות ב תשעים וארבע לאות ז",
   "לרווח הקישו כוכבית",
   "בסיום הקישו סולמית",
 ];
-const SEED_HELP_LINES = KEYPAD_HELP_PARTS.map((p) => say(p));
+const KEYPAD_HELP_LINES = KEYPAD_HELP_PARTS.map((p) => say(p));
 
 // Converts the raw seed keypad input into a validated base32 seed (spaces removed), or null.
 async function decodeSeed(raw: string): Promise<string | null> {
@@ -440,24 +440,20 @@ function decodeAccountName(raw: string): string | null {
 yemotRoute("/yemot/ext12", async (c) => {
   if (!isAuthed(c)) return ivr("go_to_folder=/99");
   const phone = callerPhone(c);
-  if (!phone) return ivr(say("מספר המתקשר אינו זמין, להתראות"), hangup());
+  if (!phone) return ivr(say("מספר המתקשר אינו זמין להתראות"), hangup());
 
-  // Step 1: seed. Instructions play before the prompt, and again after an invalid entry.
+  // Step 1: seed. Help plays once before the first prompt. A rejected entry gets only the error and the prompt again.
   const seedAll = all(c, "val_seed_raw");
   if (seedAll.length === 0) {
-    return ivr(...SEED_HELP_LINES, readCmd(SEED_PROMPT, "val_seed_raw", SEED_READ));
+    return ivr(...KEYPAD_HELP_LINES, readCmd(SEED_PROMPT, "val_seed_raw", SEED_READ));
   }
 
   const seed = await decodeSeed(latest(c, "val_seed_raw") ?? "");
   if (!seed) {
     if (seedAll.length >= MAX_INPUT_ATTEMPTS) {
-      return ivr(say("לא הצלחנו לזהות מפתח תקין, להתראות"), hangup());
+      return ivr(say("לא הצלחנו לזהות מפתח תקין להתראות"), hangup());
     }
-    return ivr(
-      say(SEED_ERROR),
-      ...SEED_HELP_LINES,
-      readCmd(SEED_PROMPT, "val_seed_raw", SEED_READ),
-    );
+    return ivr(say(SEED_ERROR), readCmd(SEED_PROMPT, "val_seed_raw", SEED_READ));
   }
 
   const user = await loadUser(phone);
@@ -476,22 +472,18 @@ yemotRoute("/yemot/ext12", async (c) => {
   }
   if (!slot) return ivr(say("אין משבצת פנויה"), "go_to_folder=/1");
 
-  // Step 2: account name. Instructions play before the prompt, and again after an invalid entry.
+  // Step 2: account name. Help is not replayed here either.
   const nameAll = all(c, "val_name_raw");
   if (nameAll.length === 0) {
-    return ivr(...SEED_HELP_LINES, readCmd(NAME_PROMPT, "val_name_raw", NAME_READ));
+    return ivr(readCmd(NAME_PROMPT, "val_name_raw", NAME_READ));
   }
 
   const name = decodeAccountName(latest(c, "val_name_raw") ?? "");
   if (!name) {
     if (nameAll.length >= MAX_INPUT_ATTEMPTS) {
-      return ivr(say("לא הצלחנו לזהות שם תקין, להתראות"), hangup());
+      return ivr(say("לא הצלחנו לזהות שם תקין להתראות"), hangup());
     }
-    return ivr(
-      say(NAME_ERROR),
-      ...SEED_HELP_LINES,
-      readCmd(NAME_PROMPT, "val_name_raw", NAME_READ),
-    );
+    return ivr(say(NAME_ERROR), readCmd(NAME_PROMPT, "val_name_raw", NAME_READ));
   }
 
   await sb("totp_accounts", {
@@ -513,7 +505,7 @@ yemotRoute("/yemot/ext12", async (c) => {
 yemotRoute("/yemot/ext13", async (c) => {
   if (!isAuthed(c)) return ivr("go_to_folder=/99");
   const phone = callerPhone(c);
-  if (!phone) return ivr(say("מספר המתקשר אינו זמין, להתראות"), hangup());
+  if (!phone) return ivr(say("מספר המתקשר אינו זמין להתראות"), hangup());
   const user = await loadUser(phone);
 
   const accounts = await accountsFor(user);
