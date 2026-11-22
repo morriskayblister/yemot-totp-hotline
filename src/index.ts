@@ -394,18 +394,27 @@ function decodeDtmfText(raw: string): string | null {
 // ---------- Folder 1/2: add account (seed, then name) ----------
 const MIN_SEED_LENGTH = 16;
 const MAX_INPUT_ATTEMPTS = 3;
+// Read limits: a base32 seed of up to 32 characters is 64 keypresses; an account name of up to 40 characters is 80.
 const SEED_PROMPT = "אנא הקש את מפתח האימות ולאחריו סולמית";
-const SEED_READ = { min: 2, max: 100, timeout: 30 };
-const SEED_ERROR = "המפתח שהוקש אינו תקין. מפתח אימות מורכב מאותיות באנגלית ומספרים שתיים עד שבע בלבד, ללא אפס אחת שמונה או תשע";
+const SEED_READ = { min: 2, max: 64, timeout: 30 };
+const SEED_ERROR = "המפתח שהוקש אינו תקין. מפתח אימות מורכב מאותיות באנגלית ומספרים שתיים עד שבע בלבד. אין להקיש אפס אחת שמונה או תשע";
 const NAME_PROMPT = "אנא הקש את שם החשבון ולאחריו סולמית";
 const NAME_READ = { min: 1, max: 80, timeout: 30 };
 const NAME_ERROR = "שם החשבון אינו תקין";
 const MAX_NAME_LENGTH = 40;
 
 // Spoken keypad instructions, played before each text prompt. Written without commas, equals signs or ampersands.
-const KEYPAD_HELP =
-  "הוראות הקלדה. כל אות או ספרה מוקלדת בשתי ספרות. לספרה הקישו אפס ואחריה הספרה, לדוגמה אפס אחת לאחת. לאות הקישו את מספר המקש ואחריו מיקום האות במקש, לדוגמה עשרים ואחת לאות א, עשרים ושתיים לאות ב, תשעים וארבע לאות ז. לרווח הקישו כוכבית. בסיום הקישו סולמית.";
-const SEED_HELP_LINES = [say(KEYPAD_HELP)];
+// Split into short sentences so the TTS plays each one cleanly.
+const KEYPAD_HELP_PARTS = [
+  "הוראות הקלדה",
+  "כל אות או ספרה מוקלדת בשתי ספרות",
+  "לספרה הקישו אפס ואחריה הספרה. לדוגמה אפס אחת לאחת",
+  "לאות הקישו את מספר המקש ואחריו מיקום האות במקש",
+  "לדוגמה עשרים ואחת לאות א. עשרים ושתיים לאות ב. תשעים וארבע לאות ז",
+  "לרווח הקישו כוכבית",
+  "בסיום הקישו סולמית",
+];
+const SEED_HELP_LINES = KEYPAD_HELP_PARTS.map((p) => say(p));
 
 // Converts the raw seed keypad input into a validated base32 seed (spaces removed), or null.
 async function decodeSeed(raw: string): Promise<string | null> {
