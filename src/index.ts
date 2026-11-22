@@ -186,7 +186,7 @@ function yemotRoute(path: string, handler: (c: Context) => Promise<Response>): v
       return await handler(c);
     } catch (err) {
       console.error(JSON.stringify({ ev: "error", path, message: String(err) }));
-      return ivr(say("שגיאת מערכת נסו שוב מאוחר יותר"), hangup());
+      return ivr(say("System error please try again later"), hangup());
     }
   });
 }
@@ -199,7 +199,7 @@ yemotRoute("/yemot", async (c) => {
 // ---------- Extension 99: router by PIN state ----------
 yemotRoute("/yemot/ext99", async (c) => {
   const phone = callerPhone(c);
-  if (!phone) return ivr(say("מספר המתקשר אינו זמין להתראות"), hangup());
+  if (!phone) return ivr(say("Caller number is not available"), hangup());
   const user = await loadUser(phone);
   return ivr(user.pin_hash ? "go_to_folder=/998" : "go_to_folder=/999");
 });
@@ -207,17 +207,17 @@ yemotRoute("/yemot/ext99", async (c) => {
 // ---------- Extension 998: verify existing PIN ----------
 yemotRoute("/yemot/ext998", async (c) => {
   const phone = callerPhone(c);
-  if (!phone) return ivr(say("מספר המתקשר אינו זמין להתראות"), hangup());
+  if (!phone) return ivr(say("Caller number is not available"), hangup());
   const user = await loadUser(phone);
   if (!user.pin_hash) return ivr("go_to_folder=/999");
 
   if (user.pin_locked_until && new Date(user.pin_locked_until) > new Date()) {
-    return ivr(say("יותר מדי ניסיונות נסו שוב מאוחר יותר"), hangup());
+    return ivr(say("Too many attempts please try again later"), hangup());
   }
 
   const entered = latest(c, "val_pin");
   if (entered === undefined) {
-    return ivr(readCmd("אנא הקש קוד סודי", "val_pin", { min: 4, max: 4 }));
+    return ivr(readCmd("Please enter your secret code", "val_pin", { min: 4, max: 4 }));
   }
 
   const { digits } = decodeDtmf(entered);
@@ -236,25 +236,25 @@ yemotRoute("/yemot/ext998", async (c) => {
     method: "PATCH",
     body: JSON.stringify({ pin_failures: lock ? 0 : failures, pin_locked_until: lock }),
   });
-  if (lock) return ivr(say("יותר מדי ניסיונות נסו שוב מאוחר יותר"), hangup());
-  return ivr(say("הקוד שגוי"), readCmd("אנא הקש קוד סודי", "val_pin", { min: 4, max: 4 }));
+  if (lock) return ivr(say("Too many attempts please try again later"), hangup());
+  return ivr(say("Incorrect code"), readCmd("Please enter your secret code", "val_pin", { min: 4, max: 4 }));
 });
 
 // ---------- Extension 999: set up a new PIN ----------
 yemotRoute("/yemot/ext999", async (c) => {
   const phone = callerPhone(c);
-  if (!phone) return ivr(say("מספר המתקשר אינו זמין להתראות"), hangup());
+  if (!phone) return ivr(say("Caller number is not available"), hangup());
   const user = await loadUser(phone);
   if (user.pin_hash) return ivr("go_to_folder=/998");
 
   const entered = latest(c, "val_pin");
   if (entered === undefined) {
-    return ivr(readCmd("שלום אנא בחר קוד סודי בן 4 ספרות", "val_pin", { min: 4, max: 4 }));
+    return ivr(readCmd("Hello please choose a 4 digit secret code", "val_pin", { min: 4, max: 4 }));
   }
 
   const { digits } = decodeDtmf(entered);
   if (digits.length !== 4) {
-    return ivr(say("קוד לא תקין"), readCmd("אנא בחר קוד סודי בן 4 ספרות", "val_pin", { min: 4, max: 4 }));
+    return ivr(say("Invalid code"), readCmd("Please choose a 4 digit secret code", "val_pin", { min: 4, max: 4 }));
   }
 
   const salt = crypto.randomUUID().slice(0, 8);
@@ -263,11 +263,11 @@ yemotRoute("/yemot/ext999", async (c) => {
     body: JSON.stringify({ pin_hash: await hashPin(digits, salt), pin_failures: 0, pin_locked_until: null }),
   });
   markAuthed(c, phone);
-  return ivr(say("הקוד נשמר בהצלחה"), "go_to_folder=/1");
+  return ivr(say("Your code was saved successfully"), "go_to_folder=/1");
 });
 
 // ---------- Extension 1: main menu fallback (native Yemot menu /1 normally handles this) ----------
-const MENU_PROMPT = "לקבלת קוד הקש 1 להזנת חשבון חדש הקש 2 למחיקת חשבון הקש 3";
+const MENU_PROMPT = "To get a code press 1 To add a new account press 2 To delete an account press 3";
 
 yemotRoute("/yemot/ext1", async (c) => {
   if (!isAuthed(c)) return ivr("go_to_folder=/99");
@@ -279,7 +279,7 @@ yemotRoute("/yemot/ext1", async (c) => {
   if (choice === "1") return ivr("go_to_folder=/1/1");
   if (choice === "2") return ivr("go_to_folder=/1/2");
   if (choice === "3") return ivr("go_to_folder=/1/3");
-  return ivr(say("בחירה לא חוקית"), readCmd(MENU_PROMPT, "val_menu", { min: 1, max: 1 }));
+  return ivr(say("Invalid choice"), readCmd(MENU_PROMPT, "val_menu", { min: 1, max: 1 }));
 });
 
 // ---------- Caller's accounts, listed by slot ----------
@@ -289,39 +289,39 @@ async function accountsFor(user: Row): Promise<Row[]> {
 }
 
 function accountName(a: Row): string {
-  return a.account_label || `משבצת ${a.slot_number}`;
+  return a.account_label || `Slot ${a.slot_number}`;
 }
 
-// Builds the spoken choice list, e.g. "עבור NAME1 הקש 1 עבור NAME2 הקש 2". "template" receives the name and slot.
+// Builds the spoken choice list, e.g. "For NAME1 press 1 For NAME2 press 2". "template" receives the name and slot.
 function accountChoicePrompt(accounts: Row[], template: (name: string, slot: number) => string): string {
   return accounts.map((a) => template(accountName(a), Number(a.slot_number))).join(" ");
 }
 
-const CODE_TEMPLATE = (name: string, slot: number) => `עבור ${name} הקש ${slot}`;
-const DELETE_TEMPLATE = (name: string, slot: number) => `למחיקת ${name} הקש ${slot}`;
+const CODE_TEMPLATE = (name: string, slot: number) => `For ${name} press ${slot}`;
+const DELETE_TEMPLATE = (name: string, slot: number) => `To delete ${name} press ${slot}`;
 
 // ---------- Folder 1/1: code playback (menu 1) ----------
 // Post-code menu: 1 repeat, 2 another slot, 9 back to main menu (/1).
 // Params: val_slot (first slot), val_slot2 (another slot), val_after (post-code menu answers).
 async function speakCode(user: Row, slot: number): Promise<Response> {
   const accounts: Row[] = await sb(`totp_accounts?user_id=eq.${user.id}&slot_number=eq.${slot}&select=*`);
-  if (!accounts[0]) return ivr(say("אין חשבון במשבצת זו"), hangup());
+  if (!accounts[0]) return ivr(say("There is no account in this slot"), hangup());
   const code = await totp(accounts[0].totp_secret, accounts[0].digits, accounts[0].period);
   return ivr(
-    say("הקוד שלך הוא"),
+    say("Your code is"),
     `id_list_message=d-${code}`,
-    readCmd("לשמיעה חוזרת הקש 1 למשבצת אחרת הקש 2 לחזרה לתפריט הראשי הקש 9", "val_after", { min: 1, max: 1 }),
+    readCmd("To hear it again press 1 For another slot press 2 To return to the main menu press 9", "val_after", { min: 1, max: 1 }),
   );
 }
 
 yemotRoute("/yemot/ext11", async (c) => {
   if (!isAuthed(c)) return ivr("go_to_folder=/99");
   const phone = callerPhone(c);
-  if (!phone) return ivr(say("מספר המתקשר אינו זמין להתראות"), hangup());
+  if (!phone) return ivr(say("Caller number is not available"), hangup());
   const user = await loadUser(phone);
 
   const accounts = await accountsFor(user);
-  if (accounts.length === 0) return ivr(say("אין חשבונות שמורים במערכת"), "go_to_folder=/1");
+  if (accounts.length === 0) return ivr(say("No accounts are saved in the system"), "go_to_folder=/1");
   const chooseMenu = (valName: string) =>
     readCmd(accountChoicePrompt(accounts, CODE_TEMPLATE), valName, { min: 1, max: 1 });
 
@@ -349,7 +349,7 @@ yemotRoute("/yemot/ext11", async (c) => {
   const after = decodeDtmf(latest(c, "val_after")).digits;
   if (after === "1") return speakCode(user, currentSlot);
   if (after === "9") return ivr("go_to_folder=/1");
-  return ivr(say("להתראות"), hangup());
+  return ivr(say("Goodbye"), hangup());
 });
 
 // ---------- Keypad text decoding (shared by seed and account name) ----------
@@ -395,24 +395,24 @@ function decodeDtmfText(raw: string): string | null {
 const MIN_SEED_LENGTH = 16;
 const MAX_INPUT_ATTEMPTS = 3;
 // Read limits: a base32 seed of up to 32 characters is 64 keypresses; an account name of up to 40 characters is 80.
-const SEED_PROMPT = "אנא הקש את מפתח האימות ולאחריו סולמית";
+const SEED_PROMPT = "Please enter the authentication key and then press pound";
 const SEED_READ = { min: 2, max: 64, timeout: 30 };
-const SEED_ERROR = "המפתח שהוקש אינו תקין מפתח אימות מורכב מאותיות באנגלית ומספרים שתיים עד שבע בלבד אין להקיש אפס אחת שמונה או תשע";
-const NAME_PROMPT = "אנא הקש את שם החשבון ולאחריו סולמית";
+const SEED_ERROR = "The key you entered is not valid An authentication key is made of English letters and digits two to seven only Do not enter zero one eight or nine";
+const NAME_PROMPT = "Please enter the account name and then press pound";
 const NAME_READ = { min: 1, max: 80, timeout: 30 };
-const NAME_ERROR = "שם החשבון אינו תקין";
+const NAME_ERROR = "The account name is not valid";
 const MAX_NAME_LENGTH = 40;
 
 // Spoken keypad instructions. Played once, before the first seed prompt only.
 // No periods, commas, quotes or hyphens: each part is a separate spoken item.
 const KEYPAD_HELP_PARTS = [
-  "הוראות הקלדה",
-  "כל אות או ספרה מוקלדת בשתי ספרות",
-  "לספרה הקישו אפס ואחריה הספרה לדוגמה אפס אחת לאחת",
-  "לאות הקישו את מספר המקש ואחריו מיקום האות במקש",
-  "לדוגמה עשרים ואחת לאות א עשרים ושתיים לאות ב תשעים וארבע לאות ז",
-  "לרווח הקישו כוכבית",
-  "בסיום הקישו סולמית",
+  "Keypad instructions",
+  "Each letter or digit is entered with two key presses",
+  "For a digit press zero and then the digit For example zero one for one",
+  "For a letter press the key number and then the letter position on that key",
+  "For example twenty one for letter A twenty two for letter B ninety four for letter Z",
+  "For a space press star",
+  "At the end press pound",
 ];
 const KEYPAD_HELP_LINES = KEYPAD_HELP_PARTS.map((p) => say(p));
 
@@ -440,7 +440,7 @@ function decodeAccountName(raw: string): string | null {
 yemotRoute("/yemot/ext12", async (c) => {
   if (!isAuthed(c)) return ivr("go_to_folder=/99");
   const phone = callerPhone(c);
-  if (!phone) return ivr(say("מספר המתקשר אינו זמין להתראות"), hangup());
+  if (!phone) return ivr(say("Caller number is not available"), hangup());
 
   // Step 1: seed. Help plays once before the first prompt. A rejected entry gets only the error and the prompt again.
   const seedAll = all(c, "val_seed_raw");
@@ -451,7 +451,7 @@ yemotRoute("/yemot/ext12", async (c) => {
   const seed = await decodeSeed(latest(c, "val_seed_raw") ?? "");
   if (!seed) {
     if (seedAll.length >= MAX_INPUT_ATTEMPTS) {
-      return ivr(say("לא הצלחנו לזהות מפתח תקין להתראות"), hangup());
+      return ivr(say("We could not recognize a valid key Goodbye"), hangup());
     }
     return ivr(say(SEED_ERROR), readCmd(SEED_PROMPT, "val_seed_raw", SEED_READ));
   }
@@ -459,7 +459,7 @@ yemotRoute("/yemot/ext12", async (c) => {
   const user = await loadUser(phone);
   const existing: Row[] = await sb(`totp_accounts?user_id=eq.${user.id}&select=slot_number,totp_secret`);
   if (existing.some((a) => a.totp_secret === seed)) {
-    return ivr(say("המפתח כבר שמור במערכת"), "go_to_folder=/1");
+    return ivr(say("This key is already saved in the system"), "go_to_folder=/1");
   }
 
   const used = new Set(existing.map((a) => Number(a.slot_number)));
@@ -470,7 +470,7 @@ yemotRoute("/yemot/ext12", async (c) => {
       break;
     }
   }
-  if (!slot) return ivr(say("אין משבצת פנויה"), "go_to_folder=/1");
+  if (!slot) return ivr(say("There is no free slot"), "go_to_folder=/1");
 
   // Step 2: account name. Help is not replayed here either.
   const nameAll = all(c, "val_name_raw");
@@ -481,7 +481,7 @@ yemotRoute("/yemot/ext12", async (c) => {
   const name = decodeAccountName(latest(c, "val_name_raw") ?? "");
   if (!name) {
     if (nameAll.length >= MAX_INPUT_ATTEMPTS) {
-      return ivr(say("לא הצלחנו לזהות שם תקין להתראות"), hangup());
+      return ivr(say("We could not recognize a valid name Goodbye"), hangup());
     }
     return ivr(say(NAME_ERROR), readCmd(NAME_PROMPT, "val_name_raw", NAME_READ));
   }
@@ -498,18 +498,18 @@ yemotRoute("/yemot/ext12", async (c) => {
       algorithm: "SHA1",
     }),
   });
-  return ivr(say("המפתח נשמר בהצלחה במשבצת"), `id_list_message=d-${slot}`, "go_to_folder=/1");
+  return ivr(say("The key was saved successfully in slot"), `id_list_message=d-${slot}`, "go_to_folder=/1");
 });
 
 // ---------- Folder 1/3: delete account, chosen by name ----------
 yemotRoute("/yemot/ext13", async (c) => {
   if (!isAuthed(c)) return ivr("go_to_folder=/99");
   const phone = callerPhone(c);
-  if (!phone) return ivr(say("מספר המתקשר אינו זמין להתראות"), hangup());
+  if (!phone) return ivr(say("Caller number is not available"), hangup());
   const user = await loadUser(phone);
 
   const accounts = await accountsFor(user);
-  if (accounts.length === 0) return ivr(say("אין חשבונות שמורים במערכת"), "go_to_folder=/1");
+  if (accounts.length === 0) return ivr(say("No accounts are saved in the system"), "go_to_folder=/1");
 
   const raw = latest(c, "val_del_slot");
   if (raw === undefined) {
@@ -520,13 +520,13 @@ yemotRoute("/yemot/ext13", async (c) => {
   const target = accounts.find((a) => String(a.slot_number) === digits);
   if (!target) {
     return ivr(
-      say("מספר משבצת לא תקין"),
+      say("Invalid slot number"),
       readCmd(accountChoicePrompt(accounts, DELETE_TEMPLATE), "val_del_slot", { min: 1, max: 1, timeout: 15 }),
     );
   }
 
   await sb(`totp_accounts?id=eq.${target.id}&user_id=eq.${user.id}`, { method: "DELETE" });
-  return ivr(say("החשבון נמחק בהצלחה"), "go_to_folder=/1");
+  return ivr(say("The account was deleted successfully"), "go_to_folder=/1");
 });
 
 app.get("/health", (c) => c.json({ ok: true }));
